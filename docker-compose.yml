@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:18-alpine
+    container_name: skeddie_db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-skeddie}
+    ports:
+      - "5432:5432"
+    volumes:
+      - skeddie_pgdata:/var/lib/postgresql/data
+      - ./packages/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-skeddie}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  solver:
+    build: ./apps/solver
+    container_name: skeddie_solver
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-changeme}@db:5432/${POSTGRES_DB:-skeddie}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./apps/solver:/app
+      - /app/venv # Prevents host venv from overriding container environment
+
+volumes:
+  skeddie_pgdata:
