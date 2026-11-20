@@ -6,6 +6,10 @@ organization's timezone to UTC.
 
 Generation is all-or-nothing and safe to re-run: slots that already exist are
 left alone, and any conflict is reported before anything is written.
+
+Slots that overlap a field, venue or organization blackout are not created.
+Slots in the season's makeup window are created; the solver keeps them free so
+they stay available for rainout makeups.
 """
 
 import uuid
@@ -20,6 +24,7 @@ from sqlalchemy.orm import Session
 from models import Field, Organization, Season, SlotRule, TimeSlot
 from services.locks import lock_season
 from services.timeutil import dates_on_weekday, local_to_utc_exact
+from services.unavailability import load_field_blackouts, overlaps_any
 
 DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 MAX_REPORTED_PROBLEMS = 25
@@ -57,6 +62,7 @@ class CarveResult:
 class SlotGenerationResult:
     created: int
     already_present: int
+    blacked_out: int
     skipped: list[str]
 
 
@@ -150,15 +156,23 @@ def generate_time_slots(db: Session, season_id: uuid.UUID) -> SlotGenerationResu
     if problems:
         raise SlotGenerationError(problems)
 
+    blackouts = load_field_blackouts(
+        db, season.organization_id, list(fields.values()), season.start_date, season.end_date, tz
+    )
     carved: list[CarvedSlot] = []
     skipped: list[str] = []
+    blacked_out = 0
     for rule in rules:
         result = carve_rule(rule, season.start_date, season.end_date, tz)
-        carved.extend(result.slots)
+        for slot in result.slots:
+            if overlaps_any(blackouts[slot.field_id], slot.start, slot.end):
+                blacked_out += 1
+            else:
+                carved.append(slot)
         skipped.extend(f"{describe(rule)} on {note}" for note in result.skipped)
 
     if not carved:
-        return SlotGenerationResult(created=0, already_present=0, skipped=skipped)
+        return SlotGenerationResult(created=0, already_present=0, blacked_out=blacked_out, skipped=skipped)
 
     window_start = min(s.start for s in carved)
     window_end = max(s.end for s in carved)
@@ -215,4 +229,6 @@ def generate_time_slots(db: Session, season_id: uuid.UUID) -> SlotGenerationResu
         for s in to_create
     )
     db.flush()
-    return SlotGenerationResult(created=len(to_create), already_present=already_present, skipped=skipped)
+    return SlotGenerationResult(
+        created=len(to_create), already_present=already_present, blacked_out=blacked_out, skipped=skipped
+    )

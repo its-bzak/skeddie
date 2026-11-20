@@ -47,13 +47,14 @@ def seed_database() -> None:
         db.flush()
         db.add(Admin(user_id=dan_user.id, organization_id=dans_org.id))
 
-        # Season: Spring 2027 (April 1 - June 30, 2027)
+        # Season: Spring 2027 (April 1 - June 30, 2027); June 24-30 is the makeup week
         spring_2027 = Season(
             organization_id=dans_org.id,
             name="Spring 2027",
             start_date=date(2027, 4, 1),
             end_date=date(2027, 6, 30),
             sport_id=basketball.id,
+            makeup_weeks=1,
         )
         db.add(spring_2027)
         db.flush()
@@ -178,12 +179,12 @@ def seed_database() -> None:
             officials_list.append(off)
         db.flush()
 
-        # Sample Unavailabilities (Recurring + Specific Date)
+        # Sample Unavailabilities (Recurring + Specific Date + Organization-wide Blackout)
         db.add(
             Unavailability(
                 organization_id=dans_org.id,
                 target_type="coach",
-                target_id=shared_coach.id,
+                coach_id=shared_coach.id,
                 day_of_week=2,  # Wednesday
                 specific_date=None,
                 start_time=time(16, 0),
@@ -195,7 +196,7 @@ def seed_database() -> None:
             Unavailability(
                 organization_id=dans_org.id,
                 target_type="team",
-                target_id=teams_by_code["2B"].id,
+                team_id=teams_by_code["2B"].id,
                 day_of_week=None,
                 specific_date=date(2027, 4, 10),
                 start_time=time(8, 0),
@@ -207,12 +208,21 @@ def seed_database() -> None:
             Unavailability(
                 organization_id=dans_org.id,
                 target_type="official",
-                target_id=officials_list[0].id,
+                official_id=officials_list[0].id,
                 day_of_week=6,  # Sunday
                 specific_date=None,
                 start_time=time(10, 0),
                 end_time=time(14, 0),
                 reason="Ref 1 unavailable Sunday mornings",
+            )
+        )
+        db.add(
+            Unavailability(
+                organization_id=dans_org.id,
+                target_type="organization",
+                day_of_week=None,
+                specific_date=date(2027, 5, 31),
+                reason="Memorial Day: all courts closed",
             )
         )
 

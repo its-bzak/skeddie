@@ -6,11 +6,24 @@ be missing (spring-forward gap) or happen twice (fall-back overlap), so every
 conversion here says how it treats those cases.
 """
 
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Iterator
 from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
+
+
+@dataclass(frozen=True)
+class Interval:
+    """A half-open [start, end) span of UTC instants, matching tstzrange '[)'."""
+
+    start: datetime
+    end: datetime
+    reason: str = ""
+
+    def overlaps(self, start: datetime, end: datetime) -> bool:
+        return self.start < end and start < self.end
 
 
 def _instants(day: date, wall: time, tz: ZoneInfo) -> list[datetime]:
@@ -39,6 +52,11 @@ def local_span_to_utc(day: date, start: time, end: time, tz: ZoneInfo) -> tuple[
     are used. The window can only grow, never shrink.
     """
     return _readings(day, start, tz)[0], _readings(day, end, tz)[-1]
+
+
+def local_day_to_utc(day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    """A whole local day, from midnight to the next midnight, as UTC (widened like local_span_to_utc)."""
+    return _readings(day, time(0), tz)[0], _readings(day + timedelta(days=1), time(0), tz)[-1]
 
 
 def _readings(day: date, wall: time, tz: ZoneInfo) -> list[datetime]:

@@ -289,6 +289,8 @@ class Season(TimestampMixin, Base):
     __tablename__ = "seasons"
     __table_args__ = (
         CheckConstraint("end_date >= start_date", name="seasons_date_order_check"),
+        CheckConstraint("makeup_weeks >= 0", name="seasons_makeup_weeks_check"),
+        CheckConstraint("makeup_weeks * 7 < end_date - start_date + 1", name="seasons_makeup_window_check"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -309,6 +311,8 @@ class Season(TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    # The last 7 x makeup_weeks days are kept free of scheduled games for rainout makeups.
+    makeup_weeks: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
     organization: Mapped["Organization"] = relationship(back_populates="seasons")
     sport: Mapped["Sport"] = relationship(back_populates="seasons")
@@ -713,8 +717,16 @@ class Unavailability(TimestampMixin, Base):
     __tablename__ = "unavailabilities"
     __table_args__ = (
         CheckConstraint(
-            "target_type IN ('coach', 'official', 'team')",
+            "target_type IN ('team', 'coach', 'official', 'field', 'venue', 'organization')",
             name="unavailabilities_target_type_check",
+        ),
+        CheckConstraint(
+            "(team_id IS NOT NULL) = (target_type = 'team') "
+            "AND (coach_id IS NOT NULL) = (target_type = 'coach') "
+            "AND (official_id IS NOT NULL) = (target_type = 'official') "
+            "AND (field_id IS NOT NULL) = (target_type = 'field') "
+            "AND (venue_id IS NOT NULL) = (target_type = 'venue')",
+            name="unavailabilities_target_check",
         ),
         CheckConstraint(
             "day_of_week >= 0 AND day_of_week <= 6",
@@ -726,7 +738,12 @@ class Unavailability(TimestampMixin, Base):
             name="unavailabilities_recurrence_check",
         ),
         CheckConstraint("end_time > start_time", name="unavailabilities_time_order_check"),
-        Index("idx_unavailabilities_lookup", "organization_id", "target_type", "target_id"),
+        CheckConstraint("(start_time IS NULL) = (end_time IS NULL)", name="unavailabilities_whole_day_check"),
+        CheckConstraint(
+            "end_date IS NULL OR (specific_date IS NOT NULL AND end_date >= specific_date)",
+            name="unavailabilities_end_date_check",
+        ),
+        Index("idx_unavailabilities_org_target", "organization_id", "target_type"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -739,12 +756,30 @@ class Unavailability(TimestampMixin, Base):
         ForeignKey("organizations.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # team | coach | official: they cannot play. field | venue | organization:
+    # a blackout. Exactly the matching *_id column is set; none for organization.
     target_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    team_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), nullable=True
+    )
+    coach_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("coaches.id", ondelete="CASCADE"), nullable=True
+    )
+    official_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("officials.id", ondelete="CASCADE"), nullable=True
+    )
+    field_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("fields.id", ondelete="CASCADE"), nullable=True
+    )
+    venue_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("venues.id", ondelete="CASCADE"), nullable=True
+    )
     day_of_week: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     specific_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    start_time: Mapped[time] = mapped_column(Time(timezone=False), nullable=False)
-    end_time: Mapped[time] = mapped_column(Time(timezone=False), nullable=False)
+    end_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    # Both NULL = the whole day.
+    start_time: Mapped[Optional[time]] = mapped_column(Time(timezone=False), nullable=True)
+    end_time: Mapped[Optional[time]] = mapped_column(Time(timezone=False), nullable=True)
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     organization: Mapped["Organization"] = relationship(back_populates="unavailabilities")

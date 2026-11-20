@@ -72,4 +72,10 @@ def precheck(problem: Problem, games: list[Game], eligibility: Eligibility) -> l
             away = problem.teams[game.away_team_id].name
             issues.append(f"{home} vs {away}: there is no open slot when both teams and their coaches are free.")
 
+    if issues and problem.makeup_weeks:
+        weeks = "week" if problem.makeup_weeks == 1 else f"{problem.makeup_weeks} weeks"
+        issues.append(
+            f"Slots in the season's last {weeks} are kept free as a makeup window and were not counted; "
+            "lowering the season's makeup_weeks makes them available."
+        )
     return issues

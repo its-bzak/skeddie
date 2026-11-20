@@ -7,12 +7,16 @@ unit-tested without a database.
 All instants are timezone-aware UTC datetimes. Intervals are half-open
 [start, end), matching tstzrange '[)' in the database, so back-to-back games
 (16:00-18:00 then 18:00-20:00) do not overlap.
+
+The open slots in a Problem are already filtered: slots on a blacked-out
+field (field, venue or organization unavailability) and slots in the season's
+makeup window are left out, so nothing downstream can schedule into them.
 """
 
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import or_, select
@@ -33,17 +37,8 @@ from models import (
     Unavailability,
     User,
 )
-from services.timeutil import dates_on_weekday, iso_week, local_date, local_span_to_utc
-
-
-@dataclass(frozen=True)
-class Interval:
-    start: datetime
-    end: datetime
-    reason: str = ""
-
-    def overlaps(self, start: datetime, end: datetime) -> bool:
-        return self.start < end and start < self.end
+from services.timeutil import Interval, iso_week, local_date
+from services.unavailability import load_field_blackouts, overlaps_any, unavailability_intervals
 
 
 @dataclass(frozen=True)
@@ -99,6 +94,11 @@ class Problem:
     coach_blocked: dict[uuid.UUID, list[Interval]] = field(default_factory=dict)
     coach_names: dict[uuid.UUID, str] = field(default_factory=dict)
     fixed_games: list[FixedGame] = field(default_factory=list)
+    # The dates games may be scheduled on (local, inclusive). playable_end is
+    # the season end minus the makeup window. None = derive from the slots.
+    season_start: date | None = None
+    playable_end: date | None = None
+    makeup_weeks: int = 0
 
     @property
     def tz(self) -> ZoneInfo:
@@ -161,6 +161,12 @@ def load_problem(db: Session, season_id: uuid.UUID) -> Problem:
         ):
             coach_names[coach_id] = f"{first} {last}"
 
+    playable_end = season.end_date - timedelta(days=7 * season.makeup_weeks)
+    fields = db.scalars(
+        select(Field).where(Field.organization_id == season.organization_id, Field.sport_id == season.sport_id)
+    ).all()
+    blackouts = load_field_blackouts(db, season.organization_id, fields, season.start_date, season.end_date, tz)
+
     slot_rows = db.execute(
         select(TimeSlot, Field.name)
         .join(Field, Field.id == TimeSlot.field_id)
@@ -174,6 +180,8 @@ def load_problem(db: Session, season_id: uuid.UUID) -> Problem:
     slots = [
         SlotInfo(s.id, s.field_id, field_name, s.start_time, s.end_time, s.division_id)
         for s, field_name in slot_rows
+        if local_date(s.start_time, tz) <= playable_end
+        and not overlaps_any(blackouts.get(s.field_id, []), s.start_time, s.end_time)
     ]
 
     team_blocked: dict[uuid.UUID, list[Interval]] = defaultdict(list)
@@ -182,9 +190,9 @@ def load_problem(db: Session, season_id: uuid.UUID) -> Problem:
     # Unavailability (local times in the organization timezone)
     targets = []
     if teams:
-        targets.append((Unavailability.target_type == "team") & Unavailability.target_id.in_(list(teams)))
+        targets.append(Unavailability.team_id.in_(list(teams)))
     if coach_ids:
-        targets.append((Unavailability.target_type == "coach") & Unavailability.target_id.in_(list(coach_ids)))
+        targets.append(Unavailability.coach_id.in_(list(coach_ids)))
     unavailability = []
     if targets:
         unavailability = db.scalars(
@@ -193,16 +201,11 @@ def load_problem(db: Session, season_id: uuid.UUID) -> Problem:
             )
         ).all()
     for u in unavailability:
-        bucket = team_blocked if u.target_type == "team" else coach_blocked
-        reason = u.reason or "unavailable"
-        days = (
-            [u.specific_date]
-            if u.specific_date is not None
-            else list(dates_on_weekday(season.start_date, season.end_date, u.day_of_week))
-        )
-        for day in days:
-            start, end = local_span_to_utc(day, u.start_time, u.end_time, tz)
-            bucket[u.target_id].append(Interval(start, end, reason))
+        intervals = unavailability_intervals(u, season.start_date, season.end_date, tz)
+        if u.team_id is not None:
+            team_blocked[u.team_id].extend(intervals)
+        else:
+            coach_blocked[u.coach_id].extend(intervals)
 
     # Games already booked that this run must not move
     if teams:
@@ -239,4 +242,7 @@ def load_problem(db: Session, season_id: uuid.UUID) -> Problem:
         coach_blocked=dict(coach_blocked),
         coach_names=coach_names,
         fixed_games=fixed_games,
+        season_start=season.start_date,
+        playable_end=playable_end,
+        makeup_weeks=season.makeup_weeks,
     )

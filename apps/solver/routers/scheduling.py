@@ -39,6 +39,7 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 class SlotGenerationOut(BaseModel):
     created: int
     already_present: int
+    blacked_out: int
     skipped: list[str]
 
 
@@ -195,7 +196,12 @@ def generate_slots(org_id: uuid.UUID, season_id: uuid.UUID, db: Session = Depend
             content={"detail": "Time slots were not generated", "problems": exc.problems},
         )
     db.commit()
-    return SlotGenerationOut(created=result.created, already_present=result.already_present, skipped=result.skipped)
+    return SlotGenerationOut(
+        created=result.created,
+        already_present=result.already_present,
+        blacked_out=result.blacked_out,
+        skipped=result.skipped,
+    )
 
 
 @router.post("/seasons/{season_id}/schedule", response_model=ScheduleOut)

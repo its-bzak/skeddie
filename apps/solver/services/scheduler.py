@@ -21,7 +21,12 @@ Hard constraints
     max_games_per_week games, counting Published games already on the calendar
 
 Soft goals (minimized): two games for a team on the same day, games on
-back-to-back days, and more games in one week than an even spread needs.
+back-to-back days, more games in one week than an even spread needs, and
+falling off an even pace across the season. Pacing: at the end of each
+Monday-Sunday week of the playable window, a team with G games should have
+played between floor and ceil of G x days_elapsed / playable_days of them;
+only games outside that band cost anything, so a well-paced schedule scores 0
+and the solver can prove it optimal quickly.
 """
 
 import math
@@ -36,10 +41,13 @@ from ortools.sat.python import cp_model
 from services.eligibility import Eligibility
 from services.matchups import Game
 from services.problem import Problem, SlotInfo
+from services.timeutil import dates_on_weekday
 
 SAME_DAY_WEIGHT = 10
 BACK_TO_BACK_WEIGHT = 3
 WEEK_CROWDING_WEIGHT = 5
+PACE_WEIGHT = 2
+SUNDAY = 6
 
 _STATUS_NAMES = {
     cp_model.OPTIMAL: "optimal",
@@ -60,6 +68,54 @@ class SolveResult:
     @property
     def found(self) -> bool:
         return self.status in ("optimal", "feasible")
+
+
+def _pacing_window(problem: Problem) -> tuple[date, date] | None:
+    """The local dates games may fall on: the season start to the end of its playable window."""
+    if not problem.slots:
+        return None
+    slot_dates = [problem.date_of(s.start) for s in problem.slots]
+    first = problem.season_start or min(slot_dates)
+    last = problem.playable_end or max(slot_dates)
+    return (first, last) if first <= last else None
+
+
+def _add_pacing(
+    model: cp_model.CpModel,
+    window: tuple[date, date],
+    by_date: dict[date, list[cp_model.IntVar]],
+    fixed_dates: dict[date, int],
+    total_games: int,
+) -> list[cp_model.LinearExprT]:
+    """Penalty terms for one team falling outside the even-pace band at each week end."""
+    first, last = window
+    span = (last - first).days + 1
+    week_ends = list(dates_on_weekday(first, last, SUNDAY))
+    if not week_ends or week_ends[-1] != last:
+        week_ends.append(last)
+
+    penalties: list[cp_model.LinearExprT] = []
+    played_so_far: cp_model.LinearExprT = 0
+    period_start = first
+    for week_end in week_ends:
+        this_week = [var for day, lits in by_date.items() if period_start <= day <= week_end for var in lits]
+        played = model.new_int_var(0, total_games, "")
+        model.add(played == played_so_far + sum(this_week))
+        played_so_far = played
+        period_start = week_end + timedelta(days=1)
+
+        # Every complete schedule has played all games by the last day.
+        if week_end == last:
+            continue
+        on_calendar = played + sum(n for day, n in fixed_dates.items() if day <= week_end)
+        elapsed = (week_end - first).days + 1
+        low = total_games * elapsed // span
+        high = -(-total_games * elapsed // span)
+        off_pace = model.new_int_var(0, total_games, "")
+        model.add(off_pace >= low - on_calendar)
+        model.add(off_pace >= on_calendar - high)
+        penalties.append(PACE_WEIGHT * off_pace)
+    return penalties
 
 
 def _add_no_overlap(model: cp_model.CpModel, entries: list[tuple[SlotInfo, cp_model.IntVar]]) -> None:
@@ -155,6 +211,7 @@ def solve(
             fixed_week[(team_id, problem.week_of(fixed.start))] += 1
             fixed_date[(team_id, problem.date_of(fixed.start))] += 1
 
+    pacing_window = _pacing_window(problem)
     penalties: list[cp_model.LinearExprT] = []
     for team_id, team_games in games_by_team.items():
         division = problem.divisions[problem.teams[team_id].division_id]
@@ -172,9 +229,10 @@ def solve(
 
         # Same day / back-to-back days (soft). Days with a Published game count
         # too, even when the team has no open slot that day.
-        fixed_days = {day for (team, day) in fixed_date if team == team_id}
+        team_fixed_dates = {day: count for (team, day), count in fixed_date.items() if team == team_id}
         games_on = {
-            day: sum(by_date.get(day, [])) + fixed_date[(team_id, day)] for day in set(by_date) | fixed_days
+            day: sum(by_date.get(day, [])) + team_fixed_dates.get(day, 0)
+            for day in set(by_date) | set(team_fixed_dates)
         }
         for day, lits in by_date.items():
             on_day = len(lits) + fixed_date[(team_id, day)]
@@ -195,6 +253,11 @@ def solve(
                 crowd = model.new_int_var(0, len(team_games), "")
                 model.add(crowd >= sum(lits) + fixed_week[(team_id, week)] - target)
                 penalties.append(WEEK_CROWDING_WEIGHT * crowd)
+
+        # Even pace across the playable window (soft)
+        if pacing_window is not None:
+            total_games = len(team_games) + sum(team_fixed_dates.values())
+            penalties.extend(_add_pacing(model, pacing_window, by_date, team_fixed_dates, total_games))
 
     if penalties:
         model.minimize(sum(penalties))
