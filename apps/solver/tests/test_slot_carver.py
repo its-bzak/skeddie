@@ -4,7 +4,7 @@ from datetime import date, datetime, time, timezone
 import pytest
 from sqlalchemy import func, select
 
-from models import Field, Organization, Season, SlotRule, Sport, TimeSlot
+from models import Field, Organization, Season, SlotRule, Sport, TimeSlot, Unavailability, Venue
 from services.slot_carver import (
     RuleSpec,
     SlotGenerationError,
@@ -174,13 +174,58 @@ def test_conflict_with_another_seasons_slot_writes_nothing(db):
     assert slot_count(db, league.season.id) == 0
 
 
-def test_seed_season_generates_1040_slots(db):
+def test_blackouts_skip_the_right_slots_on_the_right_fields(db):
+    league = make_league(db)  # Mondays in the season: 2027-04-05, 04-12, 04-19
+    other_venue = Venue(organization_id=league.org.id, name="Annex")
+    db.add(other_venue)
+    db.flush()
+    annex = Field(organization_id=league.org.id, venue_id=other_venue.id, sport_id=league.sport.id, name="Annex 1")
+    db.add(annex)
+    db.flush()
+    league.fields.append(annex)
+    for field_index in range(3):
+        add_rule(db, league, field_index, 0, time(16), time(20))
+
+    org = league.org.id
+    db.add_all([
+        Unavailability(organization_id=org, target_type="field", field_id=league.fields[0].id,
+                       specific_date=date(2027, 4, 5), start_time=time(16), end_time=time(18)),
+        Unavailability(organization_id=org, target_type="field", field_id=league.fields[1].id,
+                       day_of_week=0, start_time=time(18), end_time=time(20)),
+        Unavailability(organization_id=org, target_type="venue", venue_id=other_venue.id,
+                       specific_date=date(2027, 4, 12)),
+        Unavailability(organization_id=org, target_type="organization",
+                       specific_date=date(2027, 4, 19), end_date=date(2027, 4, 20)),
+    ])
+    db.flush()
+
+    result = generate_time_slots(db, league.season.id)
+    assert (result.created, result.blacked_out) == (7, 11)
+    remaining = {
+        (s.field_id, s.start_time.astimezone(NEW_YORK).replace(tzinfo=None))
+        for s in db.scalars(select(TimeSlot).where(TimeSlot.season_id == league.season.id))
+    }
+    court_1, court_2, annex_1 = (f.id for f in league.fields)
+    assert remaining == {
+        (court_1, datetime(2027, 4, 5, 18)), (court_1, datetime(2027, 4, 12, 16)), (court_1, datetime(2027, 4, 12, 18)),
+        (court_2, datetime(2027, 4, 5, 16)), (court_2, datetime(2027, 4, 12, 16)),
+        (annex_1, datetime(2027, 4, 5, 16)), (annex_1, datetime(2027, 4, 5, 18)),
+    }
+
+    again = generate_time_slots(db, league.season.id)
+    assert (again.created, again.already_present, again.blacked_out) == (0, 7, 11)
+
+
+def test_seed_season_generates_slots_around_memorial_day(db):
     season = db.scalar(
         select(Season).join(Organization).where(Organization.name == "Dan's Organization")
     )
     result = generate_time_slots(db, season.id)
-    assert result.created == 1040  # 4 courts x 13 weeks x (5 weekdays x 2 + 2 weekend days x 5)
+    # 4 courts x 13 weeks x (5 weekdays x 2 + 2 weekend days x 5) = 1040, minus Memorial Day (2 slots x 4 courts)
+    assert (result.created, result.blacked_out) == (1032, 8)
     assert result.skipped == []
+    starts = db.scalars(select(TimeSlot.start_time).where(TimeSlot.season_id == season.id)).all()
+    assert all(s.astimezone(NEW_YORK).date() != date(2027, 5, 31) for s in starts)
 
     easton = db.scalar(select(Season).join(Organization).where(Organization.name == "Easton Youth Athletics"))
     assert generate_time_slots(db, easton.id).created == 0  # Easton has no slot rules

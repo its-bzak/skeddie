@@ -29,7 +29,8 @@ def org_and_season(db, org_name: str):
 def scheduled(client, db):
     org, season = org_and_season(db, "Dan's Organization")
     base = f"/orgs/{org.id}/seasons/{season.id}"
-    assert client.post(f"{base}/slots/generate").json()["created"] == 1040
+    generated = client.post(f"{base}/slots/generate").json()
+    assert (generated["created"], generated["blacked_out"]) == (1032, 8)  # Memorial Day is blacked out
     response = client.post(f"{base}/schedule", json={"time_limit_seconds": 60})
     assert response.status_code == 200, response.json()
     return org, season, base
@@ -48,7 +49,7 @@ def test_full_flow_generate_schedule_list_publish(client, scheduled):
     assert {e["status"] for e in client.get(f"{base}/events").json()} == {"Published"}
 
     again = client.post(f"{base}/slots/generate").json()
-    assert (again["created"], again["already_present"]) == (0, 1040)
+    assert (again["created"], again["already_present"], again["blacked_out"]) == (0, 1032, 8)
 
 
 def test_moving_a_game_onto_a_teams_other_game_is_a_409_naming_the_team(client, db, scheduled):

@@ -5,7 +5,7 @@ from itertools import pairwise
 
 from sqlalchemy import select, text, update
 
-from models import Event, Organization, Season, Team, TimeSlot
+from models import Event, Organization, Season, SlotRule, Team, TimeSlot, Unavailability
 from services.eligibility import Eligibility
 from services.matchups import Game
 from services.persist import build_games, schedule_season
@@ -14,7 +14,7 @@ from services.problem import DivisionInfo, FixedGame, Interval, Problem, SlotInf
 from services.scheduler import diagnose_infeasible, solve
 from services.slot_carver import generate_time_slots
 from services.validate import validate_schedule
-from tests.helpers import NEW_YORK
+from tests.helpers import NEW_YORK, make_league
 
 MONDAYS = [date(2027, 4, 5), date(2027, 4, 12), date(2027, 4, 19)]
 
@@ -50,6 +50,13 @@ class ProblemBuilder:
         self.team_blocked: dict[uuid.UUID, list[Interval]] = defaultdict(list)
         self.coach_blocked: dict[uuid.UUID, list[Interval]] = defaultdict(list)
         self.fixed: list[FixedGame] = []
+        self.season_start: date | None = None
+        self.playable_end: date | None = None
+        self.makeup_weeks = 0
+
+    def season(self, start: date, playable_end: date, makeup_weeks: int = 0):
+        self.season_start, self.playable_end, self.makeup_weeks = start, playable_end, makeup_weeks
+        return self
 
     def id(self, name: str) -> uuid.UUID:
         return self.ids.setdefault(name, uuid.uuid5(uuid.NAMESPACE_DNS, name))
@@ -85,6 +92,9 @@ class ProblemBuilder:
             coach_blocked=dict(self.coach_blocked),
             coach_names=self.coach_names,
             fixed_games=self.fixed,
+            season_start=self.season_start,
+            playable_end=self.playable_end,
+            makeup_weeks=self.makeup_weeks,
         )
 
 
@@ -174,6 +184,42 @@ def test_published_games_are_worked_around_and_count_toward_caps():
     for g in games:
         if {builder.id("A"), builder.id("B")} & {g.home_team_id, g.away_team_id}:
             assert placed[g.index].start.astimezone(NEW_YORK).date() != MONDAYS[0]  # cap 1 already used
+
+
+def test_games_are_paced_evenly_instead_of_front_loaded():
+    # Six Mondays (2027-04-05 .. 05-10) with far more slots than needed; each
+    # team plays 3 games over a 6-week window.
+    mondays = [date(2027, 4, 5) + timedelta(weeks=w) for w in range(6)]
+    builder = ProblemBuilder({"U10": ["A", "B", "C", "D"]}, games_per_team=3, cap=None)
+    problem = builder.slots_at(mondays, [16, 18], fields=2).season(date(2027, 4, 5), date(2027, 5, 16)).build()
+    games, placed, result = solved(problem)
+    assert result.objective == 0
+
+    # By each Sunday, every team has played floor..ceil of 3 x days_elapsed / 42
+    for sunday in (date(2027, 4, 11), date(2027, 4, 18), date(2027, 4, 25), date(2027, 5, 2), date(2027, 5, 9)):
+        elapsed = (sunday - date(2027, 4, 5)).days + 1
+        low, high = 3 * elapsed // 42, -(-3 * elapsed // 42)
+        for team in "ABCD":
+            team_id = builder.id(team)
+            played = sum(
+                1 for g in games
+                if team_id in (g.home_team_id, g.away_team_id)
+                and placed[g.index].start.astimezone(NEW_YORK).date() <= sunday
+            )
+            assert low <= played <= high, (team, sunday, played)
+
+
+def test_precheck_mentions_the_makeup_window_when_short_of_slots():
+    problem = (
+        ProblemBuilder({"U10": ["A", "B", "C", "D"]}, games_per_team=3)
+        .slots_at([MONDAYS[0]], [16])
+        .season(MONDAYS[0], MONDAYS[1], makeup_weeks=1)
+        .build()
+    )
+    games, _ = build_games(problem)
+    issues = precheck(problem, games, Eligibility.build(problem))
+    assert any("open time slots" in i for i in issues)
+    assert issues[-1].startswith("Slots in the season's last week are kept free as a makeup window")
 
 
 def test_deterministic_mode_gives_identical_schedules():
@@ -268,7 +314,7 @@ def test_seed_league_schedules_with_every_rule_respected(db):
     outcome = schedule_season(db, season.id)
     assert outcome.ok, outcome.issues
     assert outcome.games_scheduled == 112
-    assert outcome.objective == 0  # no same-day, back-to-back or crowded weeks
+    assert outcome.objective == 0  # no same-day, back-to-back or crowded weeks, and evenly paced
 
     teams = {t.name: t.id for t in db.scalars(select(Team).where(Team.season_id == season.id))}
     rows = scheduled_games(db, season.id)
@@ -297,6 +343,14 @@ def test_seed_league_schedules_with_every_rule_respected(db):
 
     # 2B is blacked out on 2027-04-10
     assert all(start.astimezone(NEW_YORK).date() != date(2027, 4, 10) for start, _ in busy[teams["Team 2B"]])
+
+    # Nothing on Memorial Day or in the June 24-30 makeup week, and the season
+    # is not front-loaded: every team still plays in June.
+    game_dates = {start.astimezone(NEW_YORK).date() for _, start, _ in rows}
+    assert date(2027, 5, 31) not in game_dates
+    assert max(game_dates) <= date(2027, 6, 23)
+    for team_games in busy.values():
+        assert max(start for start, _ in team_games).astimezone(NEW_YORK).month == 6
 
     # Proof straight from the booking tables: no overlapping pair exists
     for table, column in (("team_bookings", "team_id"), ("coach_bookings", "coach_id")):
@@ -329,6 +383,25 @@ def test_rescheduling_keeps_published_games_and_replaces_drafts(db):
     assert kept == published
     totals = Counter(t for event, _, _ in rows for t in (event.home_team_id, event.away_team_id))
     assert set(totals.values()) == {7}
+
+
+def test_blackouts_added_after_slot_generation_and_the_makeup_window_are_respected(db):
+    league = make_league(db)  # 2027-04-05 to 2027-04-25, 4 teams x 3 games
+    for day_of_week in (0, 2):
+        db.add(SlotRule(organization_id=league.org.id, season_id=league.season.id, field_id=league.fields[0].id,
+                        day_of_week=day_of_week, start_time=time(16), end_time=time(20), slot_duration_mins=120))
+    db.flush()
+    generate_time_slots(db, league.season.id)
+
+    # Added after the slots exist: the slots stay, but the solver must not use them
+    db.add(Unavailability(organization_id=league.org.id, target_type="organization", specific_date=date(2027, 4, 12)))
+    league.season.makeup_weeks = 1  # keeps 2027-04-19 .. 04-25 free
+    db.flush()
+
+    outcome = schedule_season(db, league.season.id)
+    assert outcome.ok, outcome.issues
+    game_dates = {start.astimezone(NEW_YORK).date() for _, start, _ in scheduled_games(db, league.season.id)}
+    assert game_dates == {date(2027, 4, 5), date(2027, 4, 7), date(2027, 4, 14)}
 
 
 def test_season_without_slots_fails_precheck(db):

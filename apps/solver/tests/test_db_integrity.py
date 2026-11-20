@@ -6,12 +6,24 @@ a buggy endpoint, a script or a pgAdmin session could.
 
 import threading
 import time
+from datetime import date
+from datetime import time as clock
 
 from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from models import CoachBooking, Event, Organization, Sport, TeamBooking, TeamCoach, TimeSlot, OfficialBooking
+from models import (
+    CoachBooking,
+    Event,
+    OfficialBooking,
+    Organization,
+    Sport,
+    TeamBooking,
+    TeamCoach,
+    TimeSlot,
+    Unavailability,
+)
 from tests.helpers import add_game, add_slot, assign_official, local, make_league, rejected
 
 
@@ -310,6 +322,84 @@ def test_season_and_division_values_are_checked(db):
         league.divisions["12U"].games_per_team = 0
     with rejected(db, "23514", "divisions_max_games_per_week_check"):
         league.divisions["12U"].max_games_per_week = -1
+
+
+# ---------------------------------------------------------------------------
+# Unavailability and blackouts
+# ---------------------------------------------------------------------------
+
+
+def unavailable(league, target_type: str, **columns) -> Unavailability:
+    columns.setdefault("specific_date", date(2027, 4, 5))
+    return Unavailability(organization_id=league.org.id, target_type=target_type, **columns)
+
+
+def test_unavailability_target_must_match_its_type(db):
+    league = make_league(db)
+    team_id, coach_id = league.teams["A"].id, league.coaches["Coach A"].id
+    with rejected(db, "23514", "unavailabilities_target_check"):
+        db.add(unavailable(league, "team", coach_id=coach_id))
+    with rejected(db, "23514", "unavailabilities_target_check"):
+        db.add(unavailable(league, "team"))
+    with rejected(db, "23514", "unavailabilities_target_check"):
+        db.add(unavailable(league, "organization", field_id=league.fields[0].id))
+    db.add_all([
+        unavailable(league, "team", team_id=team_id),
+        unavailable(league, "venue", venue_id=league.venue.id),
+        unavailable(league, "organization"),
+    ])
+    db.flush()
+
+
+def test_unavailability_cannot_target_another_organization(db):
+    mine = make_league(db)
+    theirs = make_league(db)
+    with rejected(db, "23503", "unavailabilities_team_org_fkey"):
+        db.add(unavailable(mine, "team", team_id=theirs.teams["A"].id))
+    with rejected(db, "23503", "unavailabilities_field_org_fkey"):
+        db.add(unavailable(mine, "field", field_id=theirs.fields[0].id))
+
+
+def test_deleting_a_target_removes_its_unavailability(db):
+    league = make_league(db)
+    rows = [
+        unavailable(league, "team", team_id=league.teams["A"].id),
+        unavailable(league, "coach", coach_id=league.coaches["Coach B"].id),
+        unavailable(league, "field", field_id=league.fields[0].id),
+    ]
+    db.add_all(rows)
+    db.flush()
+
+    db.delete(league.teams["A"])
+    db.delete(league.coaches["Coach B"])
+    db.delete(league.fields[0])
+    db.flush()
+    assert count(db, Unavailability, organization_id=league.org.id) == 0
+
+
+def test_unavailability_time_and_date_rules(db):
+    league = make_league(db)
+    whole_day = unavailable(league, "organization")
+    date_range = unavailable(league, "organization", end_date=date(2027, 4, 9))
+    db.add_all([whole_day, date_range])
+    db.flush()
+
+    with rejected(db, "23514", "unavailabilities_whole_day_check"):
+        db.add(unavailable(league, "organization", start_time=clock(10)))
+    with rejected(db, "23514", "unavailabilities_end_date_check"):
+        db.add(unavailable(league, "organization", end_date=date(2027, 4, 4)))
+    with rejected(db, "23514", "unavailabilities_end_date_check"):
+        db.add(unavailable(league, "organization", specific_date=None, day_of_week=0, end_date=date(2027, 4, 9)))
+
+
+def test_makeup_window_must_fit_inside_the_season(db):
+    league = make_league(db)  # 2027-04-05 to 2027-04-25: 21 days
+    with rejected(db, "23514", "seasons_makeup_weeks_check"):
+        league.season.makeup_weeks = -1
+    with rejected(db, "23514", "seasons_makeup_window_check"):
+        league.season.makeup_weeks = 3
+    league.season.makeup_weeks = 2
+    db.flush()
 
 
 # ---------------------------------------------------------------------------
