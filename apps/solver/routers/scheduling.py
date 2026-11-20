@@ -4,27 +4,38 @@ Every route is scoped to the organization in the URL: a season or event that
 belongs to another organization is reported as not found. Authentication is
 not implemented yet.
 
+Building a schedule is a background run (large leagues take minutes): POST
+starts it and returns 202, then GET the run until its status is final. Runs
+execute one at a time in this process, because the solver already uses every
+core; a server restart interrupts them (see services/runs.py).
+
 Manual changes (PATCH) are policy overrides: they may ignore unavailability or
 weekly caps, but the database still makes double-booking impossible, and any
 such conflict is returned as 409 naming who is double-booked.
 """
 
+import logging
 import re
 import uuid
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field as PydanticField, model_validator
+from pydantic import BaseModel, ConfigDict, Field as PydanticField, model_validator
 from sqlalchemy import select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, aliased
 
-from database import get_db
-from models import Coach, Division, Event, Field, Official, Season, Team, TimeSlot, User
-from services.persist import schedule_season
+from database import SessionLocal, get_db
+from models import Coach, Division, Event, Field, Official, ScheduleRun, Season, Team, TimeSlot, User
+from services.persist import DEFAULT_TIME_LIMIT_SECONDS
+from services.runs import RunAlreadyActive, create_run, execute_run
 from services.slot_carver import SlotGenerationError, generate_time_slots
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orgs/{org_id}", tags=["scheduling"])
 
@@ -43,16 +54,26 @@ class SlotGenerationOut(BaseModel):
     skipped: list[str]
 
 
-class ScheduleRequest(BaseModel):
-    time_limit_seconds: float = PydanticField(default=30.0, ge=1, le=300)
+class ScheduleRunRequest(BaseModel):
+    time_limit_seconds: int = PydanticField(default=DEFAULT_TIME_LIMIT_SECONDS, ge=1, le=900)
 
 
-class ScheduleOut(BaseModel):
+class ScheduleRunOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    season_id: uuid.UUID
     status: str
+    time_limit_seconds: int
     games_scheduled: int
-    issues: list[str]
-    solve_seconds: float
     solver_status: str | None
+    solve_seconds: float | None
+    issues: list[str]
+    quality: dict | None
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
 
 
 class TeamRef(BaseModel):
@@ -180,6 +201,34 @@ def _load_events(db: Session, *conditions) -> list[EventOut]:
 
 
 # ---------------------------------------------------------------------------
+# Background runs
+# ---------------------------------------------------------------------------
+
+RunSubmitter = Callable[[uuid.UUID], object]
+
+_run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="schedule-run")
+
+
+def _run_in_background(run_id: uuid.UUID) -> None:
+    try:
+        with SessionLocal() as db:
+            execute_run(db, run_id)
+    except Exception:
+        # execute_run records solver failures on the run itself; this only
+        # fires if the run row could not be updated at all.
+        log.exception("Scheduling run %s could not be recorded", run_id)
+
+
+def submit_in_background(run_id: uuid.UUID) -> Future:
+    return _run_executor.submit(_run_in_background, run_id)
+
+
+def get_run_submitter() -> RunSubmitter:
+    """How runs are executed; tests override this to run them inline."""
+    return submit_in_background
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -204,29 +253,54 @@ def generate_slots(org_id: uuid.UUID, season_id: uuid.UUID, db: Session = Depend
     )
 
 
-@router.post("/seasons/{season_id}/schedule", response_model=ScheduleOut)
-def build_schedule(
+@router.post(
+    "/seasons/{season_id}/schedule-runs",
+    response_model=ScheduleRunOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def start_schedule_run(
     org_id: uuid.UUID,
     season_id: uuid.UUID,
-    body: ScheduleRequest | None = None,
+    body: ScheduleRunRequest | None = None,
     db: Session = Depends(get_db),
+    submit: RunSubmitter = Depends(get_run_submitter),
 ):
-    """Replace the season's Draft games with a new schedule. Published games are kept."""
-    _season_in_org(db, org_id, season_id)
-    body = body or ScheduleRequest()
-    outcome = schedule_season(db, season_id, time_limit_seconds=body.time_limit_seconds)
-    payload = ScheduleOut(
-        status=outcome.status,
-        games_scheduled=outcome.games_scheduled,
-        issues=outcome.issues,
-        solve_seconds=round(outcome.solve_seconds, 3),
-        solver_status=outcome.solver_status,
-    )
-    if not outcome.ok:
-        db.rollback()  # also restores the Draft games that were removed
-        return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, content=payload.model_dump())
+    """Start replacing the season's Draft games with a new schedule. Published games are kept."""
+    season = _season_in_org(db, org_id, season_id)
+    body = body or ScheduleRunRequest()
+    try:
+        run = create_run(db, season, body.time_limit_seconds)
+    except RunAlreadyActive as exc:
+        db.rollback()
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": "This season already has a scheduling run in progress", "run_id": str(exc.run_id)},
+        )
     db.commit()
-    return payload
+    submit(run.id)
+    db.refresh(run)
+    return ScheduleRunOut.model_validate(run)
+
+
+@router.get("/schedule-runs/{run_id}", response_model=ScheduleRunOut)
+def get_schedule_run(org_id: uuid.UUID, run_id: uuid.UUID, db: Session = Depends(get_db)):
+    run = db.get(ScheduleRun, run_id)
+    if run is None or run.organization_id != org_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Scheduling run not found")
+    return ScheduleRunOut.model_validate(run)
+
+
+@router.get("/seasons/{season_id}/schedule-runs", response_model=list[ScheduleRunOut])
+def list_schedule_runs(org_id: uuid.UUID, season_id: uuid.UUID, db: Session = Depends(get_db)):
+    """The season's 20 most recent runs, newest first."""
+    _season_in_org(db, org_id, season_id)
+    runs = db.scalars(
+        select(ScheduleRun)
+        .where(ScheduleRun.season_id == season_id)
+        .order_by(ScheduleRun.created_at.desc(), ScheduleRun.id)
+        .limit(20)
+    ).all()
+    return [ScheduleRunOut.model_validate(run) for run in runs]
 
 
 @router.get("/seasons/{season_id}/events", response_model=list[EventOut])

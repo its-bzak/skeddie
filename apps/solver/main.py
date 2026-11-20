@@ -1,10 +1,28 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from sqlalchemy import text
 
-from database import engine
+from database import SessionLocal, engine
 from routers import scheduling
+from services.runs import fail_interrupted_runs
 
-app = FastAPI(title="Skeddie Solver API")
+log = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs execute inside this process, so any left queued or running were
+    # interrupted by a restart and will never finish on their own.
+    with SessionLocal() as db:
+        interrupted = fail_interrupted_runs(db)
+    if interrupted:
+        log.warning("Marked %d interrupted scheduling run(s) as errors", interrupted)
+    yield
+
+
+app = FastAPI(title="Skeddie Solver API", lifespan=lifespan)
 app.include_router(scheduling.router)
 
 

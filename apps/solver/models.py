@@ -20,16 +20,18 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
     String,
+    Text,
     Time,
     UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint, Range, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSTZRANGE, ExcludeConstraint, Range, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -783,3 +785,55 @@ class Unavailability(TimestampMixin, Base):
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     organization: Mapped["Organization"] = relationship(back_populates="unavailabilities")
+
+
+# ---------------------------------------------------------------------------
+# Scheduling runs
+# ---------------------------------------------------------------------------
+
+
+class ScheduleRun(TimestampMixin, Base):
+    """One request to build a season's schedule, solved in the background.
+
+    queued -> running -> scheduled | precheck_failed | infeasible | timeout | error.
+    The database allows at most one queued or running run per season.
+    """
+
+    __tablename__ = "schedule_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'running', 'scheduled', 'precheck_failed', 'infeasible', 'timeout', 'error')",
+            name="schedule_runs_status_check",
+        ),
+        CheckConstraint("time_limit_seconds BETWEEN 1 AND 900", name="schedule_runs_time_limit_check"),
+        CheckConstraint(
+            "(status IN ('queued', 'running')) = (finished_at IS NULL)",
+            name="schedule_runs_finished_check",
+        ),
+        Index(
+            "schedule_runs_one_active_per_season",
+            "season_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+        Index("idx_schedule_runs_season_created", "season_id", text("created_at DESC")),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    # (season_id, organization_id) must match a season (composite FK, database-only).
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    season_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'queued'"))
+    time_limit_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    games_scheduled: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    solver_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    solve_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    issues: Mapped[list[str]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    quality: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
