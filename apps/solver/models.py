@@ -106,6 +106,10 @@ class Organization(TimestampMixin, Base):
 
 class User(TimestampMixin, Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("auth_issuer", "auth_subject", name="users_auth_identity_key"),
+        CheckConstraint("(auth_issuer IS NULL) = (auth_subject IS NULL)", name="users_auth_identity_check"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -115,6 +119,9 @@ class User(TimestampMixin, Base):
     email: Mapped[str] = mapped_column(String(150), nullable=False, unique=True)
     first_name: Mapped[str] = mapped_column(String(50), nullable=False)
     last_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    # The identity provider's id for this person, linked on first sign-in.
+    auth_issuer: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    auth_subject: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     admin_roles: Mapped[list["Admin"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     coach_roles: Mapped[list["Coach"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -837,3 +844,7 @@ class ScheduleRun(TimestampMixin, Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # NULL only for runs created before sign-in existed.
+    requested_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )

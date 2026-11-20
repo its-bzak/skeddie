@@ -1,8 +1,9 @@
 """Scheduling API: generate slots, build a schedule, inspect it, adjust it, publish it.
 
-Every route is scoped to the organization in the URL: a season or event that
-belongs to another organization is reported as not found. Authentication is
-not implemented yet.
+Every route requires a signed-in admin of the organization in the URL (see
+auth.py); the router enforces it, so no route can be added without it. The
+request's database session then runs under row-level security, so a season
+or event of another organization is invisible and reported as not found.
 
 Building a schedule is a background run (large leagues take minutes): POST
 starts it and returns 202, then GET the run until its status is final. Runs
@@ -29,7 +30,8 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, aliased
 
-from database import SessionLocal, get_db
+from auth import CurrentUser, current_user, org_admin_db
+from database import SessionLocal, get_db, scope_session
 from models import Coach, Division, Event, Field, Official, ScheduleRun, Season, Team, TimeSlot, User
 from services.persist import DEFAULT_TIME_LIMIT_SECONDS
 from services.runs import RunAlreadyActive, create_run, execute_run
@@ -37,7 +39,9 @@ from services.slot_carver import SlotGenerationError, generate_time_slots
 
 log = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/orgs/{org_id}", tags=["scheduling"])
+# org_admin_db shares the request's get_db session with every route below and
+# scopes it to the signed-in admin before the route runs.
+router = APIRouter(prefix="/orgs/{org_id}", tags=["scheduling"], dependencies=[Depends(org_admin_db)])
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -204,14 +208,17 @@ def _load_events(db: Session, *conditions) -> list[EventOut]:
 # Background runs
 # ---------------------------------------------------------------------------
 
-RunSubmitter = Callable[[uuid.UUID], object]
+# Called with (run_id, requested_by).
+RunSubmitter = Callable[[uuid.UUID, uuid.UUID], object]
 
 _run_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="schedule-run")
 
 
-def _run_in_background(run_id: uuid.UUID) -> None:
+def _run_in_background(run_id: uuid.UUID, requested_by: uuid.UUID) -> None:
     try:
         with SessionLocal() as db:
+            # The solve sees and writes only what the requesting admin may.
+            scope_session(db, requested_by)
             execute_run(db, run_id)
     except Exception:
         # execute_run records solver failures on the run itself; this only
@@ -219,8 +226,8 @@ def _run_in_background(run_id: uuid.UUID) -> None:
         log.exception("Scheduling run %s could not be recorded", run_id)
 
 
-def submit_in_background(run_id: uuid.UUID) -> Future:
-    return _run_executor.submit(_run_in_background, run_id)
+def submit_in_background(run_id: uuid.UUID, requested_by: uuid.UUID) -> Future:
+    return _run_executor.submit(_run_in_background, run_id, requested_by)
 
 
 def get_run_submitter() -> RunSubmitter:
@@ -263,13 +270,14 @@ def start_schedule_run(
     season_id: uuid.UUID,
     body: ScheduleRunRequest | None = None,
     db: Session = Depends(get_db),
+    user: CurrentUser = Depends(current_user),
     submit: RunSubmitter = Depends(get_run_submitter),
 ):
     """Start replacing the season's Draft games with a new schedule. Published games are kept."""
     season = _season_in_org(db, org_id, season_id)
     body = body or ScheduleRunRequest()
     try:
-        run = create_run(db, season, body.time_limit_seconds)
+        run = create_run(db, season, body.time_limit_seconds, requested_by=user.id)
     except RunAlreadyActive as exc:
         db.rollback()
         return JSONResponse(
@@ -277,7 +285,7 @@ def start_schedule_run(
             content={"detail": "This season already has a scheduling run in progress", "run_id": str(exc.run_id)},
         )
     db.commit()
-    submit(run.id)
+    submit(run.id, user.id)
     db.refresh(run)
     return ScheduleRunOut.model_validate(run)
 

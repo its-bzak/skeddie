@@ -7,7 +7,9 @@ cannot start competing solves.
 
 These functions take the caller's session and never open their own, so the
 caller decides where a run executes (a background thread in the API, inline
-in tests). Runs live in the API process: a restart interrupts them, and
+in tests). That session should be scoped to the admin who requested the run
+(database.scope_session), so the whole solve runs under row-level security.
+Runs live in the API process: a restart interrupts them, and
 fail_interrupted_runs() marks what was left behind.
 """
 
@@ -15,7 +17,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,13 +36,16 @@ class RunAlreadyActive(Exception):
         super().__init__(f"The season already has a scheduling run in progress ({run_id})")
 
 
-def create_run(db: Session, season: Season, time_limit_seconds: int) -> ScheduleRun:
+def create_run(
+    db: Session, season: Season, time_limit_seconds: int, *, requested_by: uuid.UUID
+) -> ScheduleRun:
     """Insert a queued run for the season. The caller commits."""
     run = ScheduleRun(
         organization_id=season.organization_id,
         season_id=season.id,
         status="queued",
         time_limit_seconds=time_limit_seconds,
+        requested_by=requested_by,
     )
     try:
         with db.begin_nested():
@@ -104,12 +109,11 @@ def _finish(db: Session, run_id: uuid.UUID, **fields) -> None:
 
 
 def fail_interrupted_runs(db: Session) -> int:
-    """Mark runs left queued or running (by a restart) as errors. Returns how many."""
-    result = db.execute(
-        update(ScheduleRun)
-        .where(ScheduleRun.status.in_(ACTIVE_STATUSES))
-        .values(status="error", error=INTERRUPTED_MESSAGE, finished_at=datetime.now(timezone.utc))
-        .execution_options(synchronize_session=False)
-    )
+    """Mark runs left queued or running (by a restart) as errors. Returns how many.
+
+    Runs across every organization, so it goes through a SECURITY DEFINER
+    function rather than the row-security-limited application role.
+    """
+    count = db.scalar(text("SELECT public.fail_interrupted_runs(:message)"), {"message": INTERRUPTED_MESSAGE})
     db.commit()
-    return result.rowcount
+    return count
