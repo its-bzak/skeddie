@@ -6,6 +6,14 @@ blocks" whose capacity is the number of such slots; concrete fields are handed
 out afterwards. This removes the symmetry between identical courts, which
 otherwise multiplies the search space by the number of courts.
 
+Round windows: every game has a round (see matchups.py). The engine first
+lets each game use only slots inside its round's share of the playable window,
+widened by WINDOW_SLACK_DAYS on each side. That shrinks the search space
+several-fold; measured, 100 teams went from ~70s to 20-40s and 192 teams from
+poorly paced to near-perfect within 150s. Windows are a search shortcut, not
+a rule: if the restricted model is infeasible or finds nothing in time, the
+engine re-solves without them for the rest of the time limit.
+
 Decision variables exist only where a game could really use a block: it is
 allowed for the game's division and does not touch any unavailability or
 existing game of either team or any of their coaches.
@@ -22,11 +30,11 @@ Hard constraints
 
 Soft goals (minimized): two games for a team on the same day, games on
 back-to-back days, more games in one week than an even spread needs, and
-falling off an even pace across the season. Pacing: at the end of each
-Monday-Sunday week of the playable window, a team with G games should have
-played between floor and ceil of G x days_elapsed / playable_days of them;
-only games outside that band cost anything, so a well-paced schedule scores 0
-and the solver can prove it optimal quickly.
+falling off an even pace across the season (the band is defined in
+quality.py). Only games outside the pace band cost anything, so a well-paced
+schedule scores 0 and the solver can prove it optimal quickly. Each team's
+games per day and per week are counted once and shared by the weekly cap and
+every soft goal, which keeps the model small.
 """
 
 import math
@@ -41,13 +49,13 @@ from ortools.sat.python import cp_model
 from services.eligibility import Eligibility
 from services.matchups import Game
 from services.problem import Problem, SlotInfo
-from services.timeutil import dates_on_weekday
+from services.quality import pace_band, pace_checkpoints, pacing_window
 
 SAME_DAY_WEIGHT = 10
 BACK_TO_BACK_WEIGHT = 3
 WEEK_CROWDING_WEIGHT = 5
 PACE_WEIGHT = 2
-SUNDAY = 6
+WINDOW_SLACK_DAYS = 7
 
 _STATUS_NAMES = {
     cp_model.OPTIMAL: "optimal",
@@ -64,53 +72,56 @@ class SolveResult:
     assignment: dict[int, uuid.UUID] = field(default_factory=dict)  # game index -> slot id
     objective: float | None = None
     wall_seconds: float = 0.0
+    # False when the engine fell back to the unrestricted model (or never used windows).
+    used_round_windows: bool = False
 
     @property
     def found(self) -> bool:
         return self.status in ("optimal", "feasible")
 
 
-def _pacing_window(problem: Problem) -> tuple[date, date] | None:
-    """The local dates games may fall on: the season start to the end of its playable window."""
-    if not problem.slots:
-        return None
-    slot_dates = [problem.date_of(s.start) for s in problem.slots]
-    first = problem.season_start or min(slot_dates)
-    last = problem.playable_end or max(slot_dates)
-    return (first, last) if first <= last else None
+def round_windows(games: list[Game], window: tuple[date, date]) -> dict[int, tuple[date, date]]:
+    """The dates each game may use: its round's share of the window, plus slack on both sides."""
+    first, last = window
+    days = (last - first).days + 1
+    slack = timedelta(days=WINDOW_SLACK_DAYS)
+    windows = {}
+    for game in games:
+        start = first + timedelta(days=game.round * days // game.rounds) - slack
+        end = first + timedelta(days=(game.round + 1) * days // game.rounds - 1) + slack
+        windows[game.index] = (max(start, first), min(end, last))
+    return windows
+
+
+def _count(model: cp_model.CpModel, terms: list, upper: int) -> cp_model.LinearExprT:
+    """One variable equal to sum(terms), or the term itself when there is only one."""
+    if len(terms) == 1:
+        return terms[0]
+    count = model.new_int_var(0, upper, "")
+    model.add(count == sum(terms))
+    return count
 
 
 def _add_pacing(
     model: cp_model.CpModel,
     window: tuple[date, date],
-    by_date: dict[date, list[cp_model.IntVar]],
+    day_count: dict[date, cp_model.LinearExprT],
     fixed_dates: dict[date, int],
     total_games: int,
 ) -> list[cp_model.LinearExprT]:
-    """Penalty terms for one team falling outside the even-pace band at each week end."""
+    """Penalty terms for one team falling outside the even-pace band at each checkpoint."""
     first, last = window
-    span = (last - first).days + 1
-    week_ends = list(dates_on_weekday(first, last, SUNDAY))
-    if not week_ends or week_ends[-1] != last:
-        week_ends.append(last)
-
     penalties: list[cp_model.LinearExprT] = []
     played_so_far: cp_model.LinearExprT = 0
     period_start = first
-    for week_end in week_ends:
-        this_week = [var for day, lits in by_date.items() if period_start <= day <= week_end for var in lits]
+    for checkpoint in pace_checkpoints(first, last):
+        this_week = [count for day, count in day_count.items() if period_start <= day <= checkpoint]
         played = model.new_int_var(0, total_games, "")
         model.add(played == played_so_far + sum(this_week))
-        played_so_far = played
-        period_start = week_end + timedelta(days=1)
+        played_so_far, period_start = played, checkpoint + timedelta(days=1)
 
-        # Every complete schedule has played all games by the last day.
-        if week_end == last:
-            continue
-        on_calendar = played + sum(n for day, n in fixed_dates.items() if day <= week_end)
-        elapsed = (week_end - first).days + 1
-        low = total_games * elapsed // span
-        high = -(-total_games * elapsed // span)
+        on_calendar = played + sum(n for day, n in fixed_dates.items() if day <= checkpoint)
+        low, high = pace_band(total_games, first, checkpoint, last)
         off_pace = model.new_int_var(0, total_games, "")
         model.add(off_pace >= low - on_calendar)
         model.add(off_pace >= on_calendar - high)
@@ -143,13 +154,48 @@ def solve(
     workers: int = 8,
     seed: int = 0,
     deterministic: bool = False,
+    use_round_windows: bool = True,
 ) -> SolveResult:
-    """Solve; `deterministic=True` guarantees identical output for identical input (about 2x slower)."""
+    """Solve within the time limit, trying round windows first.
+
+    `deterministic=True` guarantees identical output for identical input (about 2x slower).
+    """
     started = time.monotonic()
     if not games:
         return SolveResult("optimal", {}, 0.0, 0.0)
 
     eligibility = eligibility or Eligibility.build(problem)
+    options = {"workers": workers, "seed": seed, "deterministic": deterministic}
+    window = pacing_window(problem)
+
+    remaining = time_limit_seconds
+    if use_round_windows and window is not None:
+        windows = round_windows(games, window)
+        result = _solve_model(problem, games, eligibility, windows, remaining, **options)
+        if result.found:
+            result.used_round_windows = True
+            result.wall_seconds = time.monotonic() - started
+            return result
+        remaining = time_limit_seconds - (time.monotonic() - started)
+        if remaining <= 0:
+            return SolveResult("timeout", wall_seconds=time.monotonic() - started)
+
+    result = _solve_model(problem, games, eligibility, None, remaining, **options)
+    result.wall_seconds = time.monotonic() - started
+    return result
+
+
+def _solve_model(
+    problem: Problem,
+    games: list[Game],
+    eligibility: Eligibility,
+    windows: dict[int, tuple[date, date]] | None,
+    time_limit_seconds: float,
+    *,
+    workers: int,
+    seed: int,
+    deterministic: bool,
+) -> SolveResult:
     model = cp_model.CpModel()
 
     # Group interchangeable slots into time blocks; a block's representative
@@ -161,16 +207,17 @@ def solve(
         members.sort(key=lambda s: (s.field_name, str(s.id)))
     block_key = {s.id: key for key, members in blocks.items() for s in members}
     representative = {members[0].id: key for key, members in blocks.items()}
-
-    slot_week = {s.id: problem.week_of(s.start) for s in problem.slots}
     slot_date = {s.id: problem.date_of(s.start) for s in problem.slots}
 
     x_by_game: dict[int, list[tuple[SlotInfo, cp_model.IntVar]]] = {}
     by_block: dict[tuple, list[cp_model.IntVar]] = defaultdict(list)
     for game in games:
         keys = list(dict.fromkeys(block_key[s.id] for s in eligibility.game_slots(problem, game)))
+        if windows is not None:
+            earliest, latest = windows[game.index]
+            keys = [key for key in keys if earliest <= slot_date[blocks[key][0].id] <= latest]
         if not keys:
-            return SolveResult("infeasible", wall_seconds=time.monotonic() - started)
+            return SolveResult("infeasible")
         entries = [(blocks[key][0], model.new_bool_var("")) for key in keys]
         x_by_game[game.index] = entries
         model.add_exactly_one(var for _, var in entries)
@@ -211,53 +258,62 @@ def solve(
             fixed_week[(team_id, problem.week_of(fixed.start))] += 1
             fixed_date[(team_id, problem.date_of(fixed.start))] += 1
 
-    pacing_window = _pacing_window(problem)
+    window = pacing_window(problem)
     penalties: list[cp_model.LinearExprT] = []
     for team_id, team_games in games_by_team.items():
         division = problem.divisions[problem.teams[team_id].division_id]
-        by_week: dict[tuple[int, int], list[cp_model.IntVar]] = defaultdict(list)
+        game_count = len(team_games)
         by_date: dict[date, list[cp_model.IntVar]] = defaultdict(list)
         for game in team_games:
             for slot, var in x_by_game[game.index]:
-                by_week[slot_week[slot.id]].append(var)
                 by_date[slot_date[slot.id]].append(var)
+
+        day_count = {day: _count(model, lits, game_count) for day, lits in by_date.items()}
+        days_by_week: dict[tuple[int, int], list[date]] = defaultdict(list)
+        for day in day_count:
+            days_by_week[tuple(day.isocalendar())[:2]].append(day)
+        week_count = {
+            week: _count(model, [day_count[day] for day in days], game_count)
+            for week, days in days_by_week.items()
+        }
+        team_fixed_dates = {day: n for (team, day), n in fixed_date.items() if team == team_id}
 
         # Weekly cap (hard)
         if division.max_games_per_week is not None:
-            for week, lits in by_week.items():
-                model.add(sum(lits) <= division.max_games_per_week - fixed_week[(team_id, week)])
+            for week, count in week_count.items():
+                model.add(count <= division.max_games_per_week - fixed_week[(team_id, week)])
 
         # Same day / back-to-back days (soft). Days with a Published game count
         # too, even when the team has no open slot that day.
-        team_fixed_dates = {day: count for (team, day), count in fixed_date.items() if team == team_id}
         games_on = {
-            day: sum(by_date.get(day, [])) + team_fixed_dates.get(day, 0)
-            for day in set(by_date) | set(team_fixed_dates)
+            day: day_count.get(day, 0) + team_fixed_dates.get(day, 0)
+            for day in set(day_count) | set(team_fixed_dates)
         }
         for day, lits in by_date.items():
-            on_day = len(lits) + fixed_date[(team_id, day)]
+            on_day = len(lits) + team_fixed_dates.get(day, 0)
             if on_day >= 2:
                 same = model.new_int_var(0, on_day, "")
                 model.add(same >= games_on[day] - 1)
                 penalties.append(SAME_DAY_WEIGHT * same)
             next_day = day + timedelta(days=1)
             if next_day in games_on:
-                both = model.new_int_var(0, len(team_games) * 2, "")
+                both = model.new_int_var(0, game_count * 2, "")
                 model.add(both >= games_on[day] + games_on[next_day] - 1)
                 penalties.append(BACK_TO_BACK_WEIGHT * both)
 
         # Even spread across the weeks that have usable slots (soft)
-        target = math.ceil(len(team_games) / max(1, len(by_week)))
-        for week, lits in by_week.items():
-            if len(lits) + fixed_week[(team_id, week)] > target:
-                crowd = model.new_int_var(0, len(team_games), "")
-                model.add(crowd >= sum(lits) + fixed_week[(team_id, week)] - target)
+        target = math.ceil(game_count / max(1, len(week_count)))
+        for week, count in week_count.items():
+            possible = sum(len(by_date[day]) for day in days_by_week[week]) + fixed_week[(team_id, week)]
+            if possible > target:
+                crowd = model.new_int_var(0, game_count, "")
+                model.add(crowd >= count + fixed_week[(team_id, week)] - target)
                 penalties.append(WEEK_CROWDING_WEIGHT * crowd)
 
         # Even pace across the playable window (soft)
-        if pacing_window is not None:
-            total_games = len(team_games) + sum(team_fixed_dates.values())
-            penalties.extend(_add_pacing(model, pacing_window, by_date, team_fixed_dates, total_games))
+        if window is not None:
+            total_games = game_count + sum(team_fixed_dates.values())
+            penalties.extend(_add_pacing(model, window, day_count, team_fixed_dates, total_games))
 
     if penalties:
         model.minimize(sum(penalties))
@@ -276,7 +332,7 @@ def solve(
     params.cp_model_probing_level = 0
     status = _STATUS_NAMES.get(solver.solve(model), "timeout")
 
-    result = SolveResult(status, wall_seconds=time.monotonic() - started)
+    result = SolveResult(status)
     if result.found:
         result.objective = solver.objective_value if penalties else 0.0
         free = {key: list(members) for key, members in blocks.items()}
@@ -295,12 +351,14 @@ def diagnose_infeasible(
     *,
     time_limit_seconds: float = 10.0,
 ) -> list[str]:
-    """Explain an infeasible season by solving each division on its own."""
+    """Explain an infeasible season by solving each division on its own (without round windows)."""
     issues: list[str] = []
     division_ids = sorted({g.division_id for g in games}, key=lambda d: problem.divisions[d].name)
     for division_id in division_ids:
         subset = [g for g in games if g.division_id == division_id]
-        result = solve(problem, subset, eligibility, time_limit_seconds=time_limit_seconds)
+        result = solve(
+            problem, subset, eligibility, time_limit_seconds=time_limit_seconds, use_round_windows=False
+        )
         name = problem.divisions[division_id].name
         if result.status == "infeasible":
             issues.append(

@@ -10,6 +10,11 @@ For a division of n teams that each play g games:
 So every team plays exactly g games. That is impossible when n * g is odd
 (every game uses two teams), and those divisions are rejected.
 
+Every game also gets a round: within a round each team plays at most once.
+Full round robins follow the circle method (n - 1 rounds for even n, n for odd
+n, where one team rests each round); the circulant extras take a few more
+rounds. The solver uses rounds to keep each game near its share of the season.
+
 Home/away is assigned by walking an Euler circuit of the matchup graph, which
 guarantees each team's home and away counts differ by at most one.
 """
@@ -27,6 +32,9 @@ class Game:
     division_id: uuid.UUID
     home_team_id: uuid.UUID
     away_team_id: uuid.UUID
+    # Round `round` of `rounds` in the division's full matchup plan.
+    round: int = 0
+    rounds: int = 1
 
 
 class MatchupError(ValueError):
@@ -51,7 +59,7 @@ def pairings(team_ids: list[uuid.UUID], games_per_team: int) -> list[tuple[uuid.
     result: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     for _ in range(full_cycles):
-        result.extend((teams[i], teams[j]) for i in range(n) for j in range(i + 1, n))
+        result.extend(_circle_method(teams))
 
     # Offsets 1..remainder//2 each add 2 games per team; for odd remainders
     # (only possible when n is even) the "opposite" pairing adds 1 more.
@@ -61,6 +69,43 @@ def pairings(team_ids: list[uuid.UUID], games_per_team: int) -> list[tuple[uuid.
         result.extend((teams[i], teams[i + n // 2]) for i in range(n // 2))
 
     return result
+
+
+def _circle_method(teams: list[uuid.UUID]) -> list[tuple[uuid.UUID, uuid.UUID]]:
+    """Every pair once, in round order: one team stays put while the rest rotate.
+
+    With an odd number of teams a placeholder is added; whoever meets it rests
+    that round.
+    """
+    seats: list[uuid.UUID | None] = list(teams) + ([None] if len(teams) % 2 else [])
+    size = len(seats)
+    ordered = []
+    for _ in range(size - 1):
+        for i in range(size // 2):
+            home, away = seats[i], seats[size - 1 - i]
+            if home is not None and away is not None:
+                ordered.append((home, away))
+        seats = [seats[0], seats[-1], *seats[1:-1]]
+    return ordered
+
+
+def assign_rounds(pairs: list[tuple[uuid.UUID, uuid.UUID]]) -> list[int]:
+    """Give each pairing the lowest round in which neither team already plays.
+
+    On circle-method output this reproduces the circle method's own rounds.
+    """
+    teams_in_round: list[set[uuid.UUID]] = []
+    rounds = []
+    for a, b in pairs:
+        chosen = next(
+            (r for r, busy in enumerate(teams_in_round) if a not in busy and b not in busy),
+            len(teams_in_round),
+        )
+        if chosen == len(teams_in_round):
+            teams_in_round.append(set())
+        teams_in_round[chosen].update((a, b))
+        rounds.append(chosen)
+    return rounds
 
 
 def orient_balanced(pairs: list[tuple[uuid.UUID, uuid.UUID]]) -> list[tuple[uuid.UUID, uuid.UUID]]:
@@ -121,24 +166,24 @@ def division_games(
     if division.games_per_team is None:
         raise MatchupError("has no games_per_team set")
 
-    planned = Counter(
-        frozenset(pair) for pair in pairings(sorted(division.team_ids, key=str), division.games_per_team)
-    )
+    pairs = pairings(sorted(division.team_ids, key=str), division.games_per_team)
+    rounds = assign_rounds(pairs)
+    total_rounds = max(rounds) + 1
+    planned = list(zip(pairs, rounds, strict=True))
+
+    # Each Published game uses up the earliest planned meeting of its two teams.
     for game in fixed_games:
         key = frozenset((game.home_team_id, game.away_team_id))
-        if planned[key] == 0:
+        match = next((i for i, (pair, _) in enumerate(planned) if frozenset(pair) == key), None)
+        if match is None:
             raise MatchupError(
                 "has Published games that do not fit its matchup plan (an extra meeting between two "
                 "teams); cancel or unpublish them before rescheduling"
             )
-        planned[key] -= 1
+        del planned[match]
 
-    remaining: list[tuple[uuid.UUID, uuid.UUID]] = []
-    for key in sorted(planned, key=lambda k: sorted(map(str, k))):
-        a, b = sorted(key, key=str)
-        remaining.extend([(a, b)] * planned[key])
-
+    oriented = orient_balanced([pair for pair, _ in planned])
     return [
-        Game(start_index + i, division.id, home, away)
-        for i, (home, away) in enumerate(orient_balanced(remaining))
+        Game(start_index + i, division.id, home, away, round_number, total_rounds)
+        for i, ((home, away), (_, round_number)) in enumerate(zip(oriented, planned, strict=True))
     ]

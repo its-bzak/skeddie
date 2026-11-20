@@ -21,8 +21,11 @@ from services.locks import lock_season
 from services.matchups import Game, MatchupError, division_games
 from services.precheck import precheck
 from services.problem import Problem, load_problem
+from services.quality import ScheduleQuality, schedule_quality
 from services.scheduler import diagnose_infeasible, solve
 from services.validate import validate_schedule
+
+DEFAULT_TIME_LIMIT_SECONDS = 120
 
 
 @dataclass
@@ -33,6 +36,7 @@ class ScheduleOutcome:
     solve_seconds: float = 0.0
     solver_status: str | None = None
     objective: float | None = None
+    quality: ScheduleQuality | None = None
 
     @property
     def ok(self) -> bool:
@@ -61,7 +65,9 @@ def build_games(problem: Problem) -> tuple[list[Game], list[str]]:
     return games, issues
 
 
-def schedule_season(db: Session, season_id: uuid.UUID, *, time_limit_seconds: float = 30.0) -> ScheduleOutcome:
+def schedule_season(
+    db: Session, season_id: uuid.UUID, *, time_limit_seconds: float = DEFAULT_TIME_LIMIT_SECONDS
+) -> ScheduleOutcome:
     if db.get(Season, season_id) is None:
         raise LookupError(f"Season {season_id} does not exist")
 
@@ -101,6 +107,7 @@ def schedule_season(db: Session, season_id: uuid.UUID, *, time_limit_seconds: fl
     violations = validate_schedule(problem, games, result.assignment)
     if violations:
         raise ScheduleIntegrityError(violations)
+    quality = schedule_quality(problem, games, result.assignment, proven_optimal=result.status == "optimal")
 
     season = db.get(Season, season_id)
     events = [
@@ -130,4 +137,5 @@ def schedule_season(db: Session, season_id: uuid.UUID, *, time_limit_seconds: fl
         solve_seconds=result.wall_seconds,
         solver_status=result.status,
         objective=result.objective,
+        quality=quality,
     )
