@@ -26,6 +26,9 @@ pip-wheel-metadata/
 build/
 dist/
 
+# Local-development sign-in keys (apps/solver/scripts/dev_auth.py)
+.dev-auth/
+
 # Python tooling
 .pytest_cache/
 .mypy_cache/
