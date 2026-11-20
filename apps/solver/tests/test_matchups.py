@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from services.matchups import MatchupError, division_games, orient_balanced, pairings
+from services.matchups import MatchupError, assign_rounds, division_games, orient_balanced, pairings
 from services.problem import DivisionInfo, FixedGame
 
 
@@ -42,6 +42,38 @@ def test_home_and_away_are_balanced(n, g):
     away = Counter(a for _, a in oriented)
     for team in set(home) | set(away):
         assert abs(home[team] - away[team]) <= 1
+
+
+@pytest.mark.parametrize("n,g", [c for c in CASES if (c[0] * c[1]) % 2 == 0])
+def test_no_team_plays_twice_in_a_round(n, g):
+    pairs = pairings(team_ids(n), g)
+    rounds = assign_rounds(pairs)
+    per_round = Counter()
+    for (a, b), r in zip(pairs, rounds, strict=True):
+        per_round[(a, r)] += 1
+        per_round[(b, r)] += 1
+    assert max(per_round.values()) == 1
+
+
+@pytest.mark.parametrize("n", range(2, 11))
+def test_full_round_robins_use_the_circle_methods_rounds(n):
+    for cycles in (1, 2):
+        games_per_team = cycles * (n - 1)
+        if (n * games_per_team) % 2:
+            continue
+        rounds = assign_rounds(pairings(team_ids(n), games_per_team))
+        assert max(rounds) + 1 == cycles * (n - 1 if n % 2 == 0 else n)
+
+
+def test_division_games_carry_their_round_and_published_games_leave_theirs():
+    teams = team_ids(4)
+    division = DivisionInfo(uuid.uuid4(), "U10", 3, 1, tuple(teams))
+    planned = division_games(division, [])
+    assert {(g.rounds, g.round) for g in planned} == {(3, 0), (3, 1), (3, 2)}
+
+    first = next(g for g in planned if g.round == 0)
+    remaining = division_games(division, [_fixed(division, first.home_team_id, first.away_team_id)])
+    assert Counter(g.round for g in remaining) == Counter({0: 1, 1: 2, 2: 2})
 
 
 def test_seed_shape_is_a_single_round_robin():

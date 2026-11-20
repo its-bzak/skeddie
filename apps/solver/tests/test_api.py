@@ -8,11 +8,17 @@ from sqlalchemy import func, select
 from database import get_db
 from main import app
 from models import Division, Event, Organization, Season, TimeSlot
+from routers.scheduling import get_run_submitter
+from services.runs import create_run, execute_run
+
+PERFECT = {"off_pace_games": 0, "same_day_doubles": 0, "back_to_backs": 0, "proven_optimal": True}
 
 
 @pytest.fixture
 def client(db):
+    """API client on the test transaction; scheduling runs execute inline, before POST returns."""
     app.dependency_overrides[get_db] = lambda: db
+    app.dependency_overrides[get_run_submitter] = lambda: lambda run_id: execute_run(db, run_id)
     try:
         yield TestClient(app)
     finally:
@@ -31,9 +37,37 @@ def scheduled(client, db):
     base = f"/orgs/{org.id}/seasons/{season.id}"
     generated = client.post(f"{base}/slots/generate").json()
     assert (generated["created"], generated["blacked_out"]) == (1032, 8)  # Memorial Day is blacked out
-    response = client.post(f"{base}/schedule", json={"time_limit_seconds": 60})
-    assert response.status_code == 200, response.json()
+    response = client.post(f"{base}/schedule-runs", json={"time_limit_seconds": 60})
+    assert response.status_code == 202, response.json()
+    run = response.json()
+    assert (run["status"], run["games_scheduled"], run["quality"]) == ("scheduled", 112, PERFECT)
     return org, season, base
+
+
+def test_runs_can_be_fetched_and_listed(client, scheduled):
+    org, season, base = scheduled
+    (latest,) = client.get(f"{base}/schedule-runs").json()
+    fetched = client.get(f"/orgs/{org.id}/schedule-runs/{latest['id']}").json()
+    assert fetched == latest
+    assert fetched["started_at"] is not None and fetched["finished_at"] is not None
+    assert fetched["time_limit_seconds"] == 60 and fetched["error"] is None
+
+
+def test_a_second_run_while_one_is_active_is_a_409(client, db):
+    org, season = org_and_season(db, "Dan's Organization")
+    active = create_run(db, season, 60)
+    db.commit()
+
+    response = client.post(f"/orgs/{org.id}/seasons/{season.id}/schedule-runs")
+    assert response.status_code == 409
+    assert response.json()["run_id"] == str(active.id)
+
+
+def test_time_limit_is_validated(client, db):
+    org, season = org_and_season(db, "Dan's Organization")
+    url = f"/orgs/{org.id}/seasons/{season.id}/schedule-runs"
+    assert client.post(url, json={"time_limit_seconds": 0}).status_code == 422
+    assert client.post(url, json={"time_limit_seconds": 901}).status_code == 422
 
 
 def test_full_flow_generate_schedule_list_publish(client, scheduled):
@@ -125,9 +159,12 @@ def test_other_organizations_cannot_see_or_touch_the_season(client, db, schedule
     org, season, base = scheduled
     easton, _ = org_and_season(db, "Easton Youth Athletics")
     event_id = client.get(f"{base}/events").json()[0]["id"]
+    run_id = client.get(f"{base}/schedule-runs").json()[0]["id"]
 
     assert client.get(f"/orgs/{easton.id}/seasons/{season.id}/events").status_code == 404
-    assert client.post(f"/orgs/{easton.id}/seasons/{season.id}/schedule").status_code == 404
+    assert client.post(f"/orgs/{easton.id}/seasons/{season.id}/schedule-runs").status_code == 404
+    assert client.get(f"/orgs/{easton.id}/seasons/{season.id}/schedule-runs").status_code == 404
+    assert client.get(f"/orgs/{easton.id}/schedule-runs/{run_id}").status_code == 404
     assert client.patch(f"/orgs/{easton.id}/events/{event_id}", json={"status": "Cancelled"}).status_code == 404
 
 
@@ -139,16 +176,16 @@ def test_failed_schedule_reports_issues_and_keeps_the_previous_drafts(client, db
     division.games_per_team = 40  # 40 games at 2 per week cannot fit in 13 weeks
     db.commit()
 
-    response = client.post(f"{base}/schedule")
-    assert response.status_code == 422
-    body = response.json()
-    assert body["status"] == "precheck_failed"
-    assert any("allows 2 per week" in issue for issue in body["issues"])
+    response = client.post(f"{base}/schedule-runs")
+    assert response.status_code == 202
+    run = response.json()
+    assert (run["status"], run["quality"]) == ("precheck_failed", None)
+    assert any("allows 2 per week" in issue for issue in run["issues"])
     assert db.scalar(select(func.count()).select_from(Event).where(Event.season_id == season.id)) == before
 
 
-def test_easton_without_slots_gets_a_readable_422(client, db):
+def test_easton_without_slots_gets_readable_issues(client, db):
     org, season = org_and_season(db, "Easton Youth Athletics")
-    response = client.post(f"/orgs/{org.id}/seasons/{season.id}/schedule")
-    assert response.status_code == 422
-    assert any("open time slots" in issue for issue in response.json()["issues"])
+    run = client.post(f"/orgs/{org.id}/seasons/{season.id}/schedule-runs").json()
+    assert run["status"] == "precheck_failed"
+    assert any("open time slots" in issue for issue in run["issues"])

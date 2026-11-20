@@ -11,7 +11,8 @@ from services.matchups import Game
 from services.persist import build_games, schedule_season
 from services.precheck import precheck
 from services.problem import DivisionInfo, FixedGame, Interval, Problem, SlotInfo, TeamInfo
-from services.scheduler import diagnose_infeasible, solve
+from services.quality import ScheduleQuality, pacing_window, schedule_quality
+from services.scheduler import diagnose_infeasible, round_windows, solve
 from services.slot_carver import generate_time_slots
 from services.validate import validate_schedule
 from tests.helpers import NEW_YORK, make_league
@@ -209,6 +210,51 @@ def test_games_are_paced_evenly_instead_of_front_loaded():
             assert low <= played <= high, (team, sunday, played)
 
 
+def test_games_land_inside_their_round_window():
+    mondays = [date(2027, 4, 5) + timedelta(weeks=w) for w in range(10)]
+    builder = ProblemBuilder({"U12": ["A", "B", "C", "D", "E", "F"]}, games_per_team=5, cap=1)
+    problem = builder.slots_at(mondays, [16, 18], fields=2).season(date(2027, 4, 5), date(2027, 6, 13)).build()
+    games, placed, result = solved(problem)
+    assert result.used_round_windows
+    windows = round_windows(games, pacing_window(problem))
+    for g in games:
+        earliest, latest = windows[g.index]
+        assert earliest <= placed[g.index].start.astimezone(NEW_YORK).date() <= latest
+
+
+def test_round_windows_fall_back_when_a_team_is_out_for_its_whole_window():
+    mondays = [date(2027, 4, 5) + timedelta(weeks=w) for w in range(9)]
+    builder = ProblemBuilder({"U10": ["A", "B", "C", "D"]}, games_per_team=3, cap=None)
+    builder.slots_at(mondays, [16, 18], fields=2).season(date(2027, 4, 5), date(2027, 6, 6))
+    games, _ = build_games(builder.build())
+    first_game_of_a = next(g for g in games if g.round == 0 and builder.id("A") in (g.home_team_id, g.away_team_id))
+    earliest, latest = round_windows(games, pacing_window(builder.build()))[first_game_of_a.index]
+    builder.block_team("A", ny(earliest, 0), ny(latest + timedelta(days=1), 0))
+
+    _, _, result = solved(builder.build())
+    assert not result.used_round_windows
+
+
+def test_schedule_quality_counts_each_soft_goal():
+    builder = ProblemBuilder({"U10": ["A", "B", "C", "D"]}, games_per_team=1, cap=None)
+    problem = (
+        builder.slots_at([date(2027, 4, 5), date(2027, 4, 6)], [16, 18], fields=1)
+        .season(date(2027, 4, 5), date(2027, 5, 16))
+        .build()
+    )
+    a, b, c, d = (builder.id(t) for t in "ABCD")
+    division = builder.id("U10")
+    monday_16, monday_18, tuesday_16, _ = problem.slots
+    games = [Game(0, division, a, b), Game(1, division, a, c), Game(2, division, a, d)]
+    assignment = {0: monday_16.id, 1: monday_18.id, 2: tuesday_16.id}
+
+    # A plays all 3 games in the first two days of a six-week window: twice on
+    # Monday, then Tuesday. Off pace by 2, 2, 1, 1 and 0 at the five Sundays.
+    assert schedule_quality(problem, games, assignment, proven_optimal=False) == ScheduleQuality(
+        off_pace_games=6, same_day_doubles=1, back_to_backs=1, proven_optimal=False
+    )
+
+
 def test_precheck_mentions_the_makeup_window_when_short_of_slots():
     problem = (
         ProblemBuilder({"U10": ["A", "B", "C", "D"]}, games_per_team=3)
@@ -315,6 +361,7 @@ def test_seed_league_schedules_with_every_rule_respected(db):
     assert outcome.ok, outcome.issues
     assert outcome.games_scheduled == 112
     assert outcome.objective == 0  # no same-day, back-to-back or crowded weeks, and evenly paced
+    assert outcome.quality == ScheduleQuality(0, 0, 0, proven_optimal=True)
 
     teams = {t.name: t.id for t in db.scalars(select(Team).where(Team.season_id == season.id))}
     rows = scheduled_games(db, season.id)
