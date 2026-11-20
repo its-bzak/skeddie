@@ -13,7 +13,8 @@ services:
       - "5432:5432"
     volumes:
       - skeddie_pgdata:/var/lib/postgresql/data
-      - ./packages/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      # A fresh data volume is built by running every migration in name order
+      - ./packages/db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-skeddie}"]
       interval: 5s
