@@ -37,7 +37,7 @@ def seed_database() -> None:
         # =====================================================================
         # ORGANIZATION 1: Dan's Organization (4 Divisions, 32 Teams: 1A - 4H)
         # =====================================================================
-        dans_org = Organization(name="Dan's Organization", status="active")
+        dans_org = Organization(name="Dan's Organization", status="active", timezone="America/New_York")
         db.add(dans_org)
         db.flush()
 
@@ -161,7 +161,7 @@ def seed_database() -> None:
                     coach_cursor += 1
                     assigned_coach = coaches_list[coach_cursor]
 
-                db.add(TeamCoach(team_id=t.id, coach_id=assigned_coach.id))
+                db.add(TeamCoach(team_id=t.id, coach_id=assigned_coach.id, organization_id=dans_org.id))
 
         # Officials (6 referees)
         officials_list: list[Official] = []
@@ -219,7 +219,7 @@ def seed_database() -> None:
         # =====================================================================
         # ORGANIZATION 2: Easton Youth Athletics (Multi-Tenant Isolation Test)
         # =====================================================================
-        org2 = Organization(name="Easton Youth Athletics", status="active")
+        org2 = Organization(name="Easton Youth Athletics", status="active", timezone="America/New_York")
         db.add(org2)
         db.flush()
 

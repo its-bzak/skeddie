@@ -1,7 +1,20 @@
+"""ORM mapping of the Skeddie schema.
+
+The source of truth for the schema is the SQL in packages/db/migrations; this
+module mirrors it for querying. A few database-only safeguards are deliberately
+not declared here because the ORM never needs them:
+
+* composite foreign keys such as (home_team_id, division_id) -> teams, which
+  stop rows from pointing across organizations, seasons or divisions;
+* the triggers that keep team_bookings / coach_bookings / official_bookings in
+  sync with events, time slots, coach and official assignments.
+
+Never call Base.metadata.create_all(); apply the migrations instead.
+"""
+
 import uuid
 from datetime import date, datetime, time
 from typing import Optional
-from database import Base
 
 from sqlalchemy import (
     CheckConstraint,
@@ -16,7 +29,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ExcludeConstraint, UUID
+from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint, Range, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -50,6 +63,7 @@ class Organization(TimestampMixin, Base):
             "status IN ('active', 'cancelled')",
             name="valid_org_status",
         ),
+        CheckConstraint("is_valid_timezone(timezone)", name="organizations_timezone_check"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -67,6 +81,9 @@ class Organization(TimestampMixin, Base):
         nullable=False,
         server_default=text("'active'"),
     )
+    # IANA name, e.g. "America/New_York". Slot rules and unavailabilities are
+    # local wall-clock times in this zone.
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
 
     admins: Mapped[list["Admin"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
     coaches: Mapped[list["Coach"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
@@ -79,7 +96,10 @@ class Organization(TimestampMixin, Base):
     events: Mapped[list["Event"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
     slot_rules: Mapped[list["SlotRule"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
     time_slots: Mapped[list["TimeSlot"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
-    unavailabilities: Mapped[list["Unavailability"]] = relationship(back_populates="organization", cascade="all, delete-orphan")
+    unavailabilities: Mapped[list["Unavailability"]] = relationship(
+        back_populates="organization",
+        cascade="all, delete-orphan",
+    )
 
 
 class User(TimestampMixin, Base):
@@ -195,7 +215,10 @@ class Official(TimestampMixin, Base):
 
     user: Mapped["User"] = relationship(back_populates="official_roles")
     organization: Mapped["Organization"] = relationship(back_populates="officials")
-    event_assignments: Mapped[list["EventOfficial"]] = relationship(back_populates="official", cascade="all, delete-orphan")
+    event_assignments: Mapped[list["EventOfficial"]] = relationship(
+        back_populates="official",
+        cascade="all, delete-orphan",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +287,9 @@ class Field(TimestampMixin, Base):
 
 class Season(TimestampMixin, Base):
     __tablename__ = "seasons"
+    __table_args__ = (
+        CheckConstraint("end_date >= start_date", name="seasons_date_order_check"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -295,6 +321,10 @@ class Season(TimestampMixin, Base):
 
 class Division(TimestampMixin, Base):
     __tablename__ = "divisions"
+    __table_args__ = (
+        CheckConstraint("games_per_team > 0", name="divisions_games_per_team_check"),
+        CheckConstraint("max_games_per_week > 0", name="divisions_max_games_per_week_check"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -385,6 +415,8 @@ class TeamCoach(TimestampMixin, Base):
         ForeignKey("coaches.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # Must equal both the team's and the coach's organization (composite FKs).
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
 
     team: Mapped["Team"] = relationship(back_populates="coach_assignments")
     coach: Mapped["Coach"] = relationship(back_populates="team_assignments")
@@ -450,8 +482,16 @@ class Event(TimestampMixin, Base):
     division: Mapped["Division"] = relationship(back_populates="events")
     home_team: Mapped["Team"] = relationship(foreign_keys=[home_team_id], back_populates="home_events")
     away_team: Mapped["Team"] = relationship(foreign_keys=[away_team_id], back_populates="away_events")
-    official_assignments: Mapped[list["EventOfficial"]] = relationship(back_populates="event", cascade="all, delete-orphan")
+    official_assignments: Mapped[list["EventOfficial"]] = relationship(
+        back_populates="event",
+        cascade="all, delete-orphan",
+    )
     time_slot: Mapped[Optional["TimeSlot"]] = relationship(back_populates="event")
+
+    # Maintained by database triggers; read-only from the application.
+    team_bookings: Mapped[list["TeamBooking"]] = relationship(viewonly=True)
+    coach_bookings: Mapped[list["CoachBooking"]] = relationship(viewonly=True)
+    official_bookings: Mapped[list["OfficialBooking"]] = relationship(viewonly=True)
 
 
 class EventOfficial(TimestampMixin, Base):
@@ -475,6 +515,8 @@ class EventOfficial(TimestampMixin, Base):
         ForeignKey("officials.id", ondelete="CASCADE"),
         nullable=False,
     )
+    # Must equal both the event's and the official's organization (composite FKs).
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
 
     event: Mapped["Event"] = relationship(back_populates="official_assignments")
     official: Mapped["Official"] = relationship(back_populates="event_assignments")
@@ -528,11 +570,19 @@ class TimeSlot(TimestampMixin, Base):
     __tablename__ = "time_slots"
     __table_args__ = (
         CheckConstraint("end_time > start_time", name="time_slots_time_order_check"),
+        UniqueConstraint(
+            "event_id",
+            name="time_slots_event_id_key",
+            deferrable=True,
+            initially="IMMEDIATE",
+        ),
         ExcludeConstraint(
             ("field_id", "="),
             (func.tstzrange(text("start_time"), text("end_time")), "&&"),
             using="gist",
             name="time_slots_no_field_overlap",
+            deferrable=True,
+            initially="IMMEDIATE",
         ),
         Index(
             "idx_time_slots_open",
@@ -571,7 +621,6 @@ class TimeSlot(TimestampMixin, Base):
     event_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("events.id", ondelete="SET NULL"),
-        unique=True,
         nullable=True,
     )
     start_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -582,6 +631,83 @@ class TimeSlot(TimestampMixin, Base):
     field: Mapped["Field"] = relationship(back_populates="time_slots")
     division: Mapped[Optional["Division"]] = relationship(back_populates="time_slots")
     event: Mapped[Optional["Event"]] = relationship(back_populates="time_slot")
+
+
+# ---------------------------------------------------------------------------
+# Bookings (read-only ledger maintained by database triggers)
+#
+# One row per participant per scheduled, non-cancelled game. The exclusion
+# constraints make it impossible for the same team, coach or official to hold
+# two overlapping games. The database rejects any direct write to these
+# tables; change the event, its time slot, or the assignment instead.
+# ---------------------------------------------------------------------------
+
+
+class TeamBooking(Base):
+    __tablename__ = "team_bookings"
+    __table_args__ = (
+        ExcludeConstraint(
+            ("team_id", "="),
+            ("during", "&&"),
+            using="gist",
+            name="team_bookings_no_overlap",
+            deferrable=True,
+            initially="IMMEDIATE",
+        ),
+    )
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("events.id", ondelete="CASCADE"), primary_key=True
+    )
+    team_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("teams.id", ondelete="CASCADE"), primary_key=True
+    )
+    during: Mapped[Range[datetime]] = mapped_column(TSTZRANGE, nullable=False)
+
+
+class CoachBooking(Base):
+    __tablename__ = "coach_bookings"
+    __table_args__ = (
+        ExcludeConstraint(
+            ("coach_id", "="),
+            ("during", "&&"),
+            using="gist",
+            name="coach_bookings_no_overlap",
+            deferrable=True,
+            initially="IMMEDIATE",
+        ),
+    )
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("events.id", ondelete="CASCADE"), primary_key=True
+    )
+    coach_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("coaches.id", ondelete="CASCADE"), primary_key=True
+    )
+    during: Mapped[Range[datetime]] = mapped_column(TSTZRANGE, nullable=False)
+
+
+class OfficialBooking(Base):
+    __tablename__ = "official_bookings"
+    __table_args__ = (
+        ExcludeConstraint(
+            ("official_id", "="),
+            ("during", "&&"),
+            using="gist",
+            name="official_bookings_no_overlap",
+            deferrable=True,
+            initially="IMMEDIATE",
+        ),
+    )
+
+    event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("events.id", ondelete="CASCADE"), primary_key=True
+    )
+    official_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("officials.id", ondelete="CASCADE"), primary_key=True
+    )
+    during: Mapped[Range[datetime]] = mapped_column(TSTZRANGE, nullable=False)
+
 
 class Unavailability(TimestampMixin, Base):
     __tablename__ = "unavailabilities"
