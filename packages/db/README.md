@@ -53,3 +53,28 @@ Example: close every court on Memorial Day.
 INSERT INTO unavailabilities (organization_id, target_type, specific_date, reason)
 VALUES ('<organization id>', 'organization', '2027-05-31', 'Memorial Day');
 ```
+
+## Scheduling runs (003_schedule_runs)
+
+- **What a run is.** One row in `schedule_runs` for each request to build a season's schedule. The solver works in the background and records the result on the row.
+- **Statuses.** `queued` → `running` → `scheduled`, `precheck_failed`, `infeasible`, `timeout` or `error`.
+  - A finished run also stores its `issues` and, if scheduled, its `quality`: off-pace games, same-day doubles, back-to-backs, and whether it's proven optimal.
+- **One at a time.** The database allows at most one `queued` or `running` run per season, so two admins can't start competing solves.
+- **Restarts.** Runs execute inside the API process, so a restart interrupts them. On startup, any run left `queued` or `running` is marked `error`, and you start a new one.
+
+## Scheduler settings
+
+Settings stored as database rows are re-read at the start of every run. Change the row, then start a new run; editing a row never reschedules on its own. A new run replaces the Draft games and keeps the Published ones.
+
+| What | Where |
+| --- | --- |
+| Games each team plays | `divisions.games_per_team` |
+| Most games per team in one Monday–Sunday week | `divisions.max_games_per_week` (NULL = no cap) |
+| Season dates and makeup window | `seasons.start_date`, `seasons.end_date`, `seasons.makeup_weeks` |
+| Who or what is unavailable, and blackouts | `unavailabilities` |
+| Local timezone for every time above | `organizations.timezone` |
+| When fields are open | `slot_rules`; regenerate slots after changing them (see below) |
+| How long one run may take | `time_limit_seconds` when starting a run (1–900, default 120) |
+| Soft-goal weights, round-window slack, solver tuning | Constants at the top of `apps/solver/services/scheduler.py`; a code change |
+
+Slot generation only adds slots; it never removes or edits existing ones. After shortening a slot rule's hours or removing a rule, the old open slots stay, and the solver can still use them. Delete them by hand for now.
