@@ -62,6 +62,28 @@ VALUES ('<organization id>', 'organization', '2027-05-31', 'Memorial Day');
 - **One at a time.** The database allows at most one `queued` or `running` run per season, so two admins can't start competing solves.
 - **Restarts.** Runs execute inside the API process, so a restart interrupts them. On startup, any run left `queued` or `running` is marked `error`, and you start a new one.
 
+## Sign-in and row-level security (004_row_security)
+
+- **Who is calling.** `users.auth_issuer` and `users.auth_subject` hold the identity provider's stable id for a person. They're set on first sign-in, when the provider's verified email matches an existing user. There's no self-signup: add people as users (and admins) first.
+- **The application role.**
+  - The API runs every transaction as the role `skeddie_app`, with `SET LOCAL ROLE`, and records the signed-in user in `skeddie.user_id`. Both reset at the end of each transaction.
+  - Row-level security policies on every organization table limit `skeddie_app` to the organizations that user administers, for both reads and writes.
+  - With no user set, `skeddie_app` sees nothing.
+- **What deliberately bypasses it.** These `SECURITY DEFINER` functions run with their owner's rights:
+  - `resolve_user`, which maps a sign-in to a user;
+  - `fail_interrupted_runs`, the startup recovery;
+  - `app_admin_org_ids`, which the policies use;
+  - the booking-sync functions, because the triggers maintain bookings that `skeddie_app` can't write.
+- **Superusers bypass row security entirely.** So does the owner of the tables, the role that runs these migrations. Use those roles only for migrations and pgAdmin, never for the API.
+- **Production.** Connect the API with a login role that can only become `skeddie_app`:
+
+  ```sql
+  CREATE ROLE skeddie_api LOGIN PASSWORD '<strong password>' IN ROLE skeddie_app;
+  ```
+
+  Then set `DATABASE_URL` to use `skeddie_api`. In local development the API can connect as `postgres`, because it switches to `skeddie_app` for every request anyway.
+- **New tables.** Every new table needs row security and a policy, unless it holds shared reference data like `sports`. A test fails if one is missing.
+
 ## Scheduler settings
 
 Settings stored as database rows are re-read at the start of every run. Change the row, then start a new run; editing a row never reschedules on its own. A new run replaces the Draft games and keeps the Published ones.
