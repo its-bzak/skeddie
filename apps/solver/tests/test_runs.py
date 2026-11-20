@@ -4,16 +4,20 @@ import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from models import Event, Organization, ScheduleRun, Season, SlotRule, Sport
+from models import Admin, Event, Organization, ScheduleRun, Season, SlotRule, Sport
 from routers.scheduling import submit_in_background
 from services import runs
 from services.runs import INTERRUPTED_MESSAGE, create_run, execute_run, fail_interrupted_runs
 from services.slot_carver import generate_time_slots
-from tests.helpers import make_league, rejected
+from tests.helpers import add_person, make_league, rejected
 
 
 def season_of(db, org_name: str) -> Season:
     return db.scalar(select(Season).join(Organization).where(Organization.name == org_name))
+
+
+def admin_of(db, org_name: str):
+    return db.scalar(select(Admin.user_id).join(Organization).where(Organization.name == org_name))
 
 
 def run_row(league_or_season, **columns) -> ScheduleRun:
@@ -59,15 +63,16 @@ def test_run_values_are_checked(db):
 
 def test_create_run_reports_the_run_already_in_progress(db):
     season = season_of(db, "Dan's Organization")
-    active = create_run(db, season, 60)
+    dan = admin_of(db, "Dan's Organization")
+    active = create_run(db, season, 60, requested_by=dan)
     with pytest.raises(runs.RunAlreadyActive) as info:
-        create_run(db, season, 60)
+        create_run(db, season, 60, requested_by=dan)
     assert info.value.run_id == active.id
 
 
 def test_an_unexpected_failure_is_recorded_on_the_run(db, monkeypatch):
     season = season_of(db, "Dan's Organization")
-    run = create_run(db, season, 60)
+    run = create_run(db, season, 60, requested_by=admin_of(db, "Dan's Organization"))
     db.commit()
 
     def explode(*args, **kwargs):
@@ -84,8 +89,8 @@ def test_an_unexpected_failure_is_recorded_on_the_run(db, monkeypatch):
 def test_runs_left_active_by_a_restart_are_marked_as_errors(db):
     dans = season_of(db, "Dan's Organization")
     easton = season_of(db, "Easton Youth Athletics")
-    queued = create_run(db, dans, 60)
-    running = create_run(db, easton, 60)
+    queued = create_run(db, dans, 60, requested_by=admin_of(db, "Dan's Organization"))
+    running = create_run(db, easton, 60, requested_by=admin_of(db, "Easton Youth Athletics"))
     running.status, running.started_at = "running", datetime.now(timezone.utc)
     db.commit()
 
@@ -101,23 +106,25 @@ def test_runs_left_active_by_a_restart_are_marked_as_errors(db):
 # ---------------------------------------------------------------------------
 
 
-def test_background_runs_commit_through_their_own_session(database_ready):
+def test_background_runs_commit_through_their_own_session_under_row_security(database_ready):
     from database import engine
 
     with Session(engine) as setup:
         league = make_league(setup)
+        admin = add_person(setup, league.org, Admin, "Ada Admin")
         for day_of_week in (0, 2):
             setup.add(SlotRule(organization_id=league.org.id, season_id=league.season.id,
                                field_id=league.fields[0].id, day_of_week=day_of_week,
                                start_time=time(16), end_time=time(20), slot_duration_mins=120))
         setup.flush()
         generate_time_slots(setup, league.season.id)
-        run = create_run(setup, league.season, 60)
+        run = create_run(setup, league.season, 60, requested_by=admin.user_id)
         setup.commit()
         org_id, sport_id, season_id, run_id = league.org.id, league.sport.id, league.season.id, run.id
+        requested_by = admin.user_id
 
     try:
-        submit_in_background(run_id).result(timeout=120)
+        submit_in_background(run_id, requested_by).result(timeout=120)
         with Session(engine) as check:
             finished = check.get(ScheduleRun, run_id)
             assert finished.status == "scheduled", (finished.status, finished.issues, finished.error)

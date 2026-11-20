@@ -46,6 +46,52 @@ def _libpq_url(url: str) -> str:
 
 
 @pytest.fixture(scope="session")
+def signing_key():
+    """Stands in for the identity provider's private key."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture(scope="session")
+def token_verifier(signing_key):
+    from auth import TokenVerifier
+    from tests.helpers import TEST_AUDIENCE, TEST_ISSUER
+
+    public_key = signing_key.public_key()
+    return TokenVerifier(TEST_ISSUER, TEST_AUDIENCE, lambda token: public_key)
+
+
+@pytest.fixture(scope="session")
+def issue_token(signing_key):
+    """issue_token(email, subject=..., verified=..., **claim_overrides) -> a signed access token.
+
+    A claim overridden with None is left out of the token.
+    """
+    import time
+
+    import jwt
+
+    from tests.helpers import TEST_AUDIENCE, TEST_ISSUER
+
+    def issue(email: str | None, *, subject: str | None = None, verified: bool = True, **overrides) -> str:
+        now = int(time.time())
+        claims = {
+            "iss": TEST_ISSUER,
+            "aud": TEST_AUDIENCE,
+            "sub": subject or f"test|{(email or 'anonymous').lower()}",
+            "email": email,
+            "email_verified": verified,
+            "iat": now,
+            "exp": now + 3600,
+            **overrides,
+        }
+        return jwt.encode({k: v for k, v in claims.items() if v is not None}, signing_key, algorithm="RS256")
+
+    return issue
+
+
+@pytest.fixture(scope="session")
 def database_ready():
     if not TEST_DATABASE_URL:
         pytest.skip("Set DATABASE_URL or TEST_DATABASE_URL to run database tests")

@@ -29,6 +29,10 @@ from models import (
 
 NEW_YORK = ZoneInfo("America/New_York")
 
+# The identity provider the tests sign tokens as (see the conftest fixtures).
+TEST_ISSUER = "https://auth.test.skeddie"
+TEST_AUDIENCE = "skeddie-api-test"
+
 
 @contextmanager
 def rejected(db: Session, sqlstate: str, constraint: str | None = None):
